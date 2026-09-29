@@ -933,6 +933,8 @@ void Dev::alloc(int T) {
 // 时 B 的预填充直接把 A 的状态覆盖掉。槽池把「切走的那一刻」的完整状态泊进槽：
 //   * 48 个线性层的 ssm/conv 循环态 + h_prev（活态，以及预填充结束点的回退快照）
 //   * 16 个注意力层 + MTP 层的 KV 前缀（k/ksc/v/vsc，按 [0, len) 拷出）
+//   * 16 个注意力层 + MTP 层的 V 暂存区（vstage，见 Model::kv_copy_vstage：
+//     k_kv_append_v 对半满 tile 的尺度依赖它的残留，回港后接着 append 必须一致）
 // A 再回来时整段恢复，只补新消息 —— A→B→A 不再整段重算。
 // 匹配语义与单上下文复用完全一致：新序列以槽序列为前缀 → 接着算（append）；
 // 只命中到槽的快照点 → 退回快照点再补（rewind）；否则不入眼。
@@ -1191,6 +1193,8 @@ struct Model {
     bool kv_restore_slot(int idx);
     void kv_pool_clear();
     void kv_copy_slot(void* slot_dev, const std::vector<KvSeg>& segs, bool to_slot);
+    size_t kv_vstage_bytes() const;               // 每个槽额外要带的 V 暂存区字节
+    void kv_copy_vstage(void* base, bool to_slot);
     const void* kv_live_ptr(const KvSeg& g);
     int lin_slot_inv(int slot) const;             // 线性槽号 → 层号（反查 lin_slot）
     int attn_slot_inv(int slot) const;            // 注意力槽号 → 层号（反查 attn_slot）
@@ -1677,7 +1681,8 @@ void Model::init(const std::string& path, const std::string& json) {
         kv_pool.config(pc, pmb > 0 ? (size_t)pmb * 1024 * 1024 : 0);
         kv_pool.free_dev = [](void* p) { if (p) hipFree(p); };
         kv_trace = getenv("RT_KV_TRACE") && atoi(getenv("RT_KV_TRACE")) != 0;
-        const size_t one8k = KvPool::layout(kv_dims, 8192, 8191, true, mtp_on, nullptr);
+        const size_t one8k = KvPool::layout(kv_dims, 8192, 8191, true, mtp_on, nullptr) +
+                             kv_vstage_bytes();
         printf("KV 池：%d 槽 / %.1f GB 上限（约 %.0f MB/8k 会话）%s\n",
                kv_pool.cap, kv_pool.cap_bytes / 1073741824.0, one8k / 1048576.0,
                kv_pool.cap > 0 ? "" : "【已关闭】");
@@ -2429,6 +2434,33 @@ void Model::kv_copy_slot(void* slot_dev, const std::vector<KvSeg>& segs, bool to
     }
 }
 
+// V 暂存区（vstage）也要跟着 KV 一起泊船/回港。它不是「已经在 KV 里、可由位置
+// 重建」的东西：k_kv_append_v 对「只填了一半的 tile」按 amax(该 tile 已写过的所有
+// key) 定尺度，而 tile 前半段的 f32 值就留在 stage 里（见 src/k_new.hip 的
+// kv_append_v_k）。回港后如果紧接着 append（客户端把已提交序列原样带回来就是这条
+// 路），第一个 append 落在 tile 中间，前半段 stage 已被别的对话覆盖 → 这一格的 V
+// 尺度是错的。整个 stage 每层只有 KV*BG*D*4（本机 256 KB，16 层共 4 MB），一起搬
+// 最省心，也让「一个槽 = 活跃状态的一份完整快照」这个不变式真正成立。
+size_t Model::kv_vstage_bytes() const {
+    if (n_attn <= 0) return 0;
+    const size_t one = (size_t)cfg.n_kv * BG * cfg.head_dim * 4;
+    return (size_t)n_attn * one + (mtp_on ? one : 0);
+}
+
+void Model::kv_copy_vstage(void* base, bool to_slot) {
+    const size_t one = (size_t)cfg.n_kv * BG * cfg.head_dim * 4;
+    char* p = (char*)base;
+    for (int i = 0; i < n_attn; i++, p += one) {
+        float* v = vstage[attn_slot_inv(i)];
+        if (to_slot) CK(hipMemcpyAsync(p, v, one, hipMemcpyDeviceToDevice, 0));
+        else         CK(hipMemcpyAsync(v, p, one, hipMemcpyDeviceToDevice, 0));
+    }
+    if (mtp_on && mtp_vstage) {
+        if (to_slot) CK(hipMemcpyAsync(p, mtp_vstage, one, hipMemcpyDeviceToDevice, 0));
+        else         CK(hipMemcpyAsync(mtp_vstage, p, one, hipMemcpyDeviceToDevice, 0));
+    }
+}
+
 // 把当前活跃对话泊进池（切走 / 被整段重算替换之前调用）。
 // keep：紧接着要恢复的槽号，泊船时绝不能驱逐它（-1=无）。
 // 不变式守卫：ctx_ids 与 seq_len 失步（被调试 op 动过）就不泊，宁可丢。
@@ -2436,7 +2468,8 @@ void Model::kv_save_active(int keep) {
     if (kv_pool.cap <= 0 || ctx_ids.empty() || (int)ctx_ids.size() != seq_len) return;
     const bool snap = ctx_snap_valid && ctx_snap_len >= 0 &&
                       (size_t)ctx_snap_len <= ctx_ids.size();
-    const size_t need = kv_slot_bytes(seq_len, mtp_len, snap);
+    const size_t kvb = kv_slot_bytes(seq_len, mtp_len, snap);
+    const size_t need = kvb + kv_vstage_bytes();
     const int home = kv_pool.acquire_home(need, keep);
     if (home < 0) return;
     // 备份缓冲按需重建（对话切换是人一次次的时间尺度，精确分配省显存）
@@ -2446,6 +2479,7 @@ void Model::kv_save_active(int keep) {
     std::vector<KvSeg> segs;
     KvPool::layout(kv_dims, seq_len, mtp_len, snap, mtp_on, &segs);
     kv_copy_slot(s.dev, segs, true);
+    kv_copy_vstage((char*)s.dev + kvb, true);
     kv_pool.commit_save(home, ctx_ids, seq_len, mtp_len,
                         snap ? ctx_snap_len : -1, snap, s.dev, need);
     if (kv_trace)
@@ -2461,9 +2495,11 @@ bool Model::kv_restore_slot(int idx) {
     if (!s.used || !s.dev || s.bytes == 0 || (int)s.ids.size() != s.seq_len) return false;
     const bool snap = s.snap_valid && s.snap_len >= 0 && (size_t)s.snap_len <= s.ids.size();
     std::vector<KvSeg> segs;
-    if (KvPool::layout(kv_dims, s.seq_len, s.mtp_len, snap, mtp_on, &segs) != s.bytes)
+    const size_t kvb = KvPool::layout(kv_dims, s.seq_len, s.mtp_len, snap, mtp_on, &segs);
+    if (kvb + kv_vstage_bytes() != s.bytes)
         return false;                       // 布局对不上（维度变过？）宁可不恢复
     kv_copy_slot(s.dev, segs, false);
+    kv_copy_vstage((char*)s.dev + kvb, false);
     seq_len = s.seq_len;
     mtp_len = s.mtp_len;
     ctx_ids = s.ids;
