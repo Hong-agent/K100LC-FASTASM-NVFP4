@@ -169,6 +169,26 @@ def _conv_msg_key(m):
     return (m.get('role'), c)
 
 
+def _conv_ids_reusable(conv, ids):
+    """本次 ids 与「这条会话已提交给引擎的 token 序列」是否前缀相容。
+
+    只有一个是另一个的前缀时，引擎按 token 前缀复用出来的 KV 才确实属于同一段
+    历史（客户端原样重发、要求重新生成、带工具的会话轮次之间都属这一类）。
+    只要中间分叉（改了历史 / 换了会话），就宁可整段重算：两个会话的系统提示词
+    往往是同一段，公共前缀能有好几千 token，不挡的话引擎会把别的会话的 KV
+    整段搬过来。
+    """
+    if not conv:
+        return False
+    with _CONV_KV_LOCK:
+        st = _CONV_KV.get(conv)
+    if not st or st.get('epoch') != (ENGINE.epoch if ENGINE else 0):
+        return False
+    committed = st['ids']
+    n = min(len(committed), len(ids))
+    return committed[:n] == ids[:n]
+
+
 def _conv_prefix_ids(conv, msgs, kw):
     """历史能接在已提交序列后面就返回 (ids, rendered)，否则返回 None。"""
     if not conv:
@@ -722,6 +742,16 @@ def build_ids_and_embeds(body, conv=None):
 
     conv 非空且历史与上一轮完全一致时，走「拼接已提交 token 序列」的快路径，
     让引擎侧 KV 复用能完全命中（见 _conv_prefix_ids 的说明）。
+
+    返回值第 5 项 noreuse：没能走快路径、且本次 ids 与这条会话已提交的 token 序列
+    不是前缀相容（见 _conv_ids_reusable）时，显式要求引擎整段重算。引擎只认 token
+    前缀，会拿「公共前缀 ≥ 快照点」的任何东西做 rewind —— 对「客户端重分词组句导致
+    的自然分叉」这正是我们要的，但两种情况必须挡掉（服务端是唯一知道客户端到底改没
+    改、是不是同一条会话的地方）：
+      * 客户端改了历史（keys 对不上）：宁可整段重算，也不能拿旧序列顶替新历史；
+      * 换了会话 / 这条会话还没提交过前缀：两个会话的系统提示词（技能/工具定义）
+        往往是同一段，公共前缀能有好几千 token，不挡的话会把别的会话的 KV
+        整段搬过来（换会话必须冷启动，实测踩过）。
     """
     if body.get('messages'):
         msgs, embeds = prepare_messages_and_embeds(body['messages'])
@@ -736,18 +766,21 @@ def build_ids_and_embeds(body, conv=None):
         if plain:
             hit = _conv_prefix_ids(conv, msgs, kw)
             if hit is not None:
-                return hit[0], hit[1], embeds, msgs
+                return hit[0], hit[1], embeds, msgs, False
         txt = T.apply_chat(msgs, add_generation_prompt=True, **kw)
-        return T.encode(txt), txt, embeds, msgs
+        ids = T.encode(txt)
+        return ids, txt, embeds, msgs, bool(conv) and not _conv_ids_reusable(conv, ids)
     prompt = body.get('prompt', '')
     if isinstance(prompt, list):
         prompt = prompt[0]
-    return T.encode(prompt), prompt, [], []
+    # 纯 completions（没有 messages / conversation_id）保持旧的「按 token 前缀复用」，
+    # 基准脚本反复预填同一段 prompt 就靠它。
+    return T.encode(prompt), prompt, [], [], False
 
 
 def build_ids(body):
     """兼容旧调用：只返回 token id 和渲染文本。"""
-    ids, txt, _e, _m = build_ids_and_embeds(body)
+    ids, txt, _e, _m, _nr = build_ids_and_embeds(body)
     return ids, txt
 
 
@@ -979,7 +1012,7 @@ def _write_embeddings_file(embeds):
     return path
 
 
-async def _engine_prefill(ids, embeds, emb_path, spans):
+async def _engine_prefill(ids, embeds, emb_path, spans, noreuse=False):
     """prefill 的崩溃自愈版：引擎子进程死掉（驱动故障/OOM/内核越界）时先
     Engine.ensure() 重新拉起，再全量重试一次。重启后引擎 KV 清零，prefill
     本身幂等（自动整段重算），重试是安全的；再失败就原样抛出。"""
@@ -987,6 +1020,8 @@ async def _engine_prefill(ids, embeds, emb_path, spans):
         try:
             if embeds:
                 return await asyncio.to_thread(ENGINE.prefill_emb, ids, emb_path, spans)
+            if noreuse:
+                return await asyncio.to_thread(ENGINE.prefill_noreuse, ids)
             return await asyncio.to_thread(ENGINE.prefill, ids)
         except RuntimeError as e:
             if attempt or '引擎' not in str(e):
@@ -994,12 +1029,12 @@ async def _engine_prefill(ids, embeds, emb_path, spans):
             await asyncio.to_thread(ENGINE.ensure)      # 死了 → 重启 → 重试一次
 
 
-async def _prefill_with(ids, embeds):
+async def _prefill_with(ids, embeds, noreuse=False):
     """按需把视觉 embedding 写临时文件并执行 PREFILL / PREFILL_EMB。"""
     spans = _image_token_spans(ids, embeds) if embeds else []
     emb_path = _write_embeddings_file(embeds) if embeds else None
     try:
-        st = await _engine_prefill(ids, embeds, emb_path, spans)
+        st = await _engine_prefill(ids, embeds, emb_path, spans, noreuse)
     finally:
         if emb_path:
             try:
@@ -1251,7 +1286,8 @@ async def _complete(body: dict):
     n, temp, top_p, top_k, seed = sampling(body)
     conv = _conversation_id(body)
     # 文档/图片整理、视觉桥调用和 tokenizer 都不占 GPU；放线程里避免卡住事件循环。
-    ids, text, embeds, msgs_in = await asyncio.to_thread(build_ids_and_embeds, body, conv)
+    ids, text, embeds, msgs_in, noreuse = await asyncio.to_thread(
+        build_ids_and_embeds, body, conv)
     if not ids:
         raise HTTPException(400, '空 prompt')
     if ENGINE is None:
@@ -1280,7 +1316,7 @@ async def _complete(body: dict):
                 print(f'[serve] set_mtp 失败: {e}', file=sys.stderr)
         t0 = time.time()
         try:
-            st = await _engine_prefill(ids, embeds, emb_path, spans)
+            st = await _engine_prefill(ids, embeds, emb_path, spans, noreuse)
         finally:
             if emb_path:
                 try:
@@ -1486,13 +1522,17 @@ async def _skill_events(body, tools):
             work = dict(body)
             work['messages'] = msgs
             work['tools'] = tools
-            ids, rendered, embeds, msgs_in = await asyncio.to_thread(build_ids_and_embeds, work, conv)
+            ids, rendered, embeds, msgs_in, noreuse = await asyncio.to_thread(
+                build_ids_and_embeds, work, conv)
             if not ids:
                 raise HTTPException(400, '空 prompt')
             if len(ids) + n > CTX_LIMIT:
                 n = clamp_max_tokens(len(ids), n)
             t0 = time.time()
-            st_pf = await _prefill_with(ids, embeds)
+            # 只在第一轮用 noreuse：那是「换了会话 / 改了历史」真正会发生的地方。
+            # 同一次请求里为了跑工具而追加的后续轮次，历史是服务端自己拼的，同属
+            # 这条会话，允许引擎按前缀接着算。
+            st_pf = await _prefill_with(ids, embeds, noreuse and rnd == 0)
             t1 = time.time()
             # 逐 token 读引擎输出：边生成边发，避免「等整段生成完才出现」
             toks = []

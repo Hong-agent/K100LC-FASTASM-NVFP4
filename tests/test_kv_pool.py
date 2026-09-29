@@ -63,12 +63,26 @@ static void test_layout() {
     // 注意力段（seq=100：krow=100*32*4，vrows=25，vtiles=2）
     check("kc 几何",  g[5].width == (size_t)100*(128/4)*4 && g[5].height == 8 &&
                       g[5].pitch_live == (size_t)8192*(128/4)*4);
-    check("ksc 几何", g[6].width == 2*(size_t)100*4 && g[6].height == 8 &&
-                      g[6].pitch_live == 2*(size_t)8192*4);
+    // ksc 是「组优先」的 [H][2][kv]：两个 128 维组各占一整段 kv，整块按 [H*2][kv]
+    // 连续，所以每层搬 KV*2 行、行距 = 一整段 kv（见 src/k_new.hip 的 k_kv_append_k
+    // 与 src/k_fa.hip 的 Kscb[g*kv_cap + kv]）。这里 KV=8 → 16 行。
+    check("ksc 几何", g[6].width == (size_t)100*4 && g[6].height == 16 &&
+                      g[6].pitch_live == (size_t)8192*4);
     check("vc 几何",  g[7].width == ((100+3)/4)*(size_t)128*4 && g[7].height == 8 &&
                       g[7].pitch_live == (8192/4)*(size_t)128*4);
     check("vsc 几何", g[8].width == ((100+63)/64)*(size_t)128*4 && g[8].height == 8 &&
                       g[8].pitch_live == (8192/64)*(size_t)128*4);
+    // 回归守卫：每段在 live 侧必须落在该注意力层自己的分配里（layer_bytes），
+    // 即 (height-1)*pitch_live + width ≤ layer_bytes。
+    const size_t KV = 8, MC = 8192, D = 128, KVEL = 4, BG = 64;
+    const size_t layer_bytes[4] = { KV * MC * (D / KVEL) * 4, KV * 2 * MC * 4,
+                                    KV * (MC / KVEL) * D * 4, KV * (MC / BG) * D * 4 };
+    bool fit = true;
+    for (int k = 0; k < 4; k++) {
+        const KvSeg& s = g[5 + k];
+        fit = fit && (s.height - 1) * s.pitch_live + s.width <= layer_bytes[k];
+    }
+    check("注意力段不越出每层分配", fit);
     // 总量手算：线性 16576 + 3 层 × (8×(12800+800+12800+1024))
     check("layout 总字节", L1 == 2*(size_t)64 + 2*(size_t)32 + (size_t)4096*4
                                   + 3 * 8 * (12800 + 800 + 12800 + 1024));
@@ -82,7 +96,8 @@ static void test_layout() {
     const size_t L3 = KvPool::layout(d, 100, 99, true, true, &g3);
     check("layout MTP 多 4 段", g3.size() == 26 && g3[22].src == 10 && g3[25].src == 13);
     check("layout MTP 段几何",
-          g3[22].width == (size_t)99*32*4 && g3[23].width == 2*(size_t)99*4 &&
+          g3[22].width == (size_t)99*32*4 && g3[23].width == (size_t)99*4 &&
+          g3[23].height == 16 && g3[23].pitch_live == (size_t)8192*4 &&
           g3[24].width == ((99+3)/4)*(size_t)128*4 && g3[25].width == ((99+63)/64)*(size_t)128*4);
     check("layout MTP 增量",
           L3 == L2 + 8 * ((size_t)99*32*4 + 2*(size_t)99*4 + 25*(size_t)512 + 2*(size_t)512));

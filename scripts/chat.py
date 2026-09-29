@@ -156,6 +156,12 @@ class Engine:
             self.cmd('PREFILL ' + ','.join(str(i) for i in ids))
             return self.p.stdout.readline().strip()
 
+    def prefill_noreuse(self, ids):
+        """整段重算这一轮，禁用一切 KV 复用（服务端发现历史被改动时用）。"""
+        with self.lock:
+            self.cmd('PREFILL_NR ' + ','.join(str(i) for i in ids))
+            return self.p.stdout.readline().strip()
+
     def prefill_emb(self, ids, emb_path, spans):
         """带视觉 embedding 的 prefill；spans 为 [(start, count), ...]。"""
         spec = ','.join(f'{int(s)}:{int(c)}' for s, c in spans)

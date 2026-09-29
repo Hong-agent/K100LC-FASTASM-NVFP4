@@ -1010,7 +1010,11 @@ struct KvPool {
         const size_t vtiles = ((size_t)seq + bg - 1) / bg;     // v 尺度覆盖前缀的 tile 数
         for (int i = 0; i < d.n_attn; i++) {
             push(6, i, MC * (D / kvel) * 4, krow, KV);         // kcache   [H][kv][D/kvel]
-            push(7, i, 2 * MC * 4, 2 * (size_t)seq * 4, KV);   // ksc      [H][2][kv]
+            // ksc 是「组优先」的 [H][2][kv]（见 src/k_new.hip 的 k_kv_append_k 与
+            // src/k_fa.hip 的 Kscb[g*kv_cap + kv]）：两个 128 维组各占一整段 kv。
+            // 整块按 [H*2][kv] 连续，所以每层要按行搬 KV*2 段、每段 seq 个 float，
+            // 行距 = 一整段 kv（MC*4）。不能当成「每 head 一段 2*seq」来搬。
+            push(7, i, MC * 4, (size_t)seq * 4, KV * 2);       // ksc      [H][2][kv]
             push(8, i, (MC / kvel) * D * 4, vrows * D * 4, KV);// vcache   [H][kv/kvel][D]
             push(9, i, (MC / bg) * D * 4, vtiles * D * 4, KV);// vsc      [H][tile][D]
         }
@@ -1019,7 +1023,7 @@ struct KvPool {
             const size_t mvrows = ((size_t)mtp + kvel - 1) / kvel;
             const size_t mvtiles = ((size_t)mtp + bg - 1) / bg;
             push(10, 0, MC * (D / kvel) * 4, mrow, KV);
-            push(11, 0, 2 * MC * 4, 2 * (size_t)mtp * 4, KV);
+            push(11, 0, MC * 4, (size_t)mtp * 4, KV * 2);      // mtp_ksc  [H][2][kv]
             push(12, 0, (MC / kvel) * D * 4, mvrows * D * 4, KV);
             push(13, 0, (MC / bg) * D * 4, mvtiles * D * 4, KV);
         }
@@ -2689,6 +2693,9 @@ static std::vector<int> parse_ids(const std::string& s) {
 // 引擎模式：stdin 逐行命令、stdout 逐行结果（scripts/serve.py 当作模型进程）。
 //   RESET                                    状态清零
 //   PREFILL <id,id,...>                      前向（按 CHUNK 自动分块），回 top-5
+//   PREFILL_NR <id,id,...>                   同 PREFILL，但本轮禁用一切 KV 复用
+//                                            （跳过活跃前缀与全局槽池的匹配，整段重算；
+//                                            服务端发现「改了历史 / 换了会话」时用）
 //   PREFILL_EMB <ids> <emb_file> <s:c,...>   同 PREFILL，但用视觉塔 embedding 覆盖
 //                                            [s,s+c) 行的词嵌入（emb_file 为 f32）
 //   IMG_EMB <patch_file> <out_file> <gh> <gw>
@@ -2731,7 +2738,13 @@ static void engine_loop(Model& m) {
     //   1')/2') 的候选不止当前上下文：全局 KV 槽池里泊着的别的对话也算（A→B→A 时
     //   A 的 KV 在槽里，恢复它比整段重算便宜得多）。槽赢了就先把当前对话泊进池、
     //   再把槽恢复成活跃上下文，然后照常走 1)/2)。
-    auto run_prefill = [&](const std::vector<int>& ids, const EmbSpan* spans, int nspans) {
+    // force_nr：本次 PREFILL 禁用一切复用（活跃上下文的前缀 + 全局槽池都跳过），
+    // 直接整段重算。服务端在「客户端改了历史」时会用它（见 scripts/serve.py）：
+    // 引擎只认 token 前缀，分不出「助手那段是客户端重分词导致的自然分叉」还是
+    // 「历史被真改了」，所以由知道 keys 的服务端来要求整段重算。
+    // 跳过的是「匹配」，不是「入池」：当前活跃上下文照常先泊进池（A→B→A 不受影响）。
+    auto run_prefill = [&](const std::vector<int>& ids, const EmbSpan* spans, int nspans,
+                           bool force_nr = false) {
         size_t start = 0;
         size_t lcp = 0;
         const char* mode = "none";
@@ -2745,7 +2758,8 @@ static void engine_loop(Model& m) {
         // 只有纯文本才复用：带视觉 embedding 的 prompt 不能靠 token 前缀判断。
         // RT_NO_KV_REUSE=1 可关掉复用（A/B 对拍、排查问题时用）。
         static const bool no_reuse = getenv("RT_NO_KV_REUSE") && atoi(getenv("RT_NO_KV_REUSE")) != 0;
-        if (!no_reuse && nspans == 0) {
+        const bool may_reuse = !no_reuse && !force_nr;
+        if (may_reuse && nspans == 0) {
             // ---- 先问全局槽池：别的对话也许比当前上下文更值得用（A→B→A）----
             if (m.kv_pool.cap > 0) {
                 size_t active_start = 0;
@@ -2796,7 +2810,17 @@ static void engine_loop(Model& m) {
         // 后面重跑这一小截的成本可以忽略，换来前缀一定命中。
         // 代价：每轮多算 tail 个 token（默认 8）。
         static const int tail = getenv("RT_KV_TAIL") ? std::max(0, atoi(getenv("RT_KV_TAIL"))) : 8;
-        const size_t snap_at = ids.size() > (size_t)tail ? ids.size() - tail : 0;
+        // 快照点还必须是 V 量化 tile 的边界（BG 的整数倍）。原因：k_kv_append_v 对
+        // 「只填了一半的 tile」是按 amax(该 tile 已写过的所有 key) 定尺度的，而 tile
+        // 前半段的 f32 值来自暂存 stage 的残留（见 kernels/flash_attn_core.h 顶部与
+        // src/k_new.hip 的 kv_append_v_k）。退回快照点重算时若 snap 落在 tile 中间，
+        // 前半段 stage 可能是别的对话/别的步留下的 —— 尺度就错了，恢复出来的回答会
+        // 和整段重算不一致（A→B→A 实测）。对齐到 tile 边界后整个 tile 一次写完，
+        // 尺度只由本次写入的 key 决定，与整段重算逐位等价。
+        // 向下取整只会让快照点更早（最多多算 BG-1 个 token），不影响「前缀一定命中」。
+        const int bg = m.BG > 0 ? m.BG : 1;
+        const size_t snap_at = ids.size() > (size_t)tail
+                             ? (((ids.size() - tail) / (size_t)bg) * (size_t)bg) : 0;
         bool snap_taken = false;
         auto t0 = std::chrono::steady_clock::now();
         for (size_t off = start; off < ids.size();) {
@@ -2855,6 +2879,9 @@ static void engine_loop(Model& m) {
         } else if (op == "PREFILL") {
             const std::vector<int> ids = parse_ids(arg);
             run_prefill(ids, nullptr, 0);
+        } else if (op == "PREFILL_NR") {          // 禁用复用（服务端改了历史时用）
+            const std::vector<int> ids = parse_ids(arg);
+            run_prefill(ids, nullptr, 0, true);
         } else if (op == "PREFILL_EMB") {
             const size_t p1 = arg.find(' ');
             const size_t p2 = p1 == std::string::npos ? std::string::npos
