@@ -17,7 +17,9 @@ NVFP4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网页�
 
 > 80 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于原 DTK 编译产物；
 > 打成一个 363,560 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
-> **0**）；MLP 的 168 个张量用 checkpoint 原样的 NVFP4 直跑（权重零误差）。
+> **0**）；**全部 401 个线性层**都用 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
+> 原样（权重零误差），其余 233 个（注意力/线性注意力投影、lm_head、56~63 层 MLP）
+> 由 `tools/nvfp4_quant.py` 从 FP8 按同一规格重量化。
 
 ## 快速开始
 
@@ -93,8 +95,9 @@ RP4=/path/to/model.rp4 bash scripts/setup_models.sh
 | 自研汇编器 | 80/80 个模型内核从 `.s` 汇编，**逐字节等于原 DTK 编译产物**（207,296 B） |
 | 自研 HSACO | 单文件 **363,560 B**，含 80 个内核；HSA 解析全部符号并执行 |
 | 运行时依赖 | `build/rt` 只链接 **libhsa-runtime64.so.1**；DTK 库引用 **0** |
-| 模型加载 | `.rp4` 单文件 **15.765 GB**，1535 张量（main 851 / NVFP4 168 / MTP+视觉 348） |
-| NVFP4 直跑 | **168 个 MLP 张量**改为原样 NVFP4 直跑（**8.423 GB，权重零误差**） |
+| 模型加载 | `.rp4` 单文件 **16.263 GB**，2001 张量（main 851 / NVFP4 802 / MTP+视觉 348） |
+| NVFP4 直跑 | **401 个线性层**走 NVFP4（其中 168 个 MLP 原样零误差，233 个由 FP8 重量化，实测相对 RMS ≈ 9.5%） |
+| 性能权衡 | 全部线性层 NVFP4 时预填充 **251 tok/s**、解码 21 tok/s；只让 MLP 走 NVFP4 时预填充 **295 tok/s**（`NVFP4_ALL=0` 打包）。见 [docs/BENCHLOG.md](docs/BENCHLOG.md) |
 | KV cache | 16 个注意力层跑 **int8**（每 dword 4 个元素，尺度 `amax/127`，与 Q/P 同走 `v_dot4_i32_i8`） |
 | 端到端对话 | 64 层模型，预填充 58 token，生成 48 token（墙钟 1.49 s），输出连贯 |
 | 网页 / 接口 | `GET /`（控制台）、`GET /style.css`、`GET /health`、`POST /v1/chat/completions` 全部正常 |
@@ -174,8 +177,12 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 ## 六个关键设计点
 
-第一，**NVFP4 直跑、权重无损**。`I = 2 x E2M1` 落在 [-12,12] 且是整数，
-所以 FP4 → int8 无损，可直接喂 `v_dot4_i32_i8`；误差只来自激活量化。
+第一，**NVFP4 直跑覆盖全部线性层**。`I = 2 x E2M1` 落在 [-12,12] 且是整数，
+所以 FP4 → int8 无损，可直接喂 `v_dot4_i32_i8`；MLP 那 168 个张量用的是
+checkpoint 原样 NVFP4（权重零误差），其余 233 个线性层由 `tools/nvfp4_quant.py`
+按**同一规格**（每 16 个 k 一个 E4M3 尺度 + 逐张量 F32 全局尺度）重量化，
+权重相对 RMS ≈ 9.5%（对照 RT4 int4/128 的 ≈ 12%）。
+代价是预填充慢 15%：RT4 的 W4A8 虽然跑两遍 int4 GEMM，每遍都比 NVFP4 GEMM 快得多。
 
 第二，**解码便宜**。`v_perm_b32` 当 8 字节 LUT，一个打包字解成两组 int8 约 19 条
 指令（2.6 条/元素），在访存受限的解码里是白送的。

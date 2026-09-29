@@ -83,6 +83,10 @@ void k_nvfp4_gemv(float* y, const void* wp, const void* ws, float inv_gscale,
                   const float* x, int rows, int N, int K);
 void k_nvfp4_gemm(float* y, const void* wp, const void* ws, float inv_gscale,
                   const float* x, int M, int N, int K);
+// 诊断（NVCHK）：最近一次量化出来的激活码与尺度（偶 k / 奇 k / 每 16 一组）
+const int8_t* k_nvfp4_act_even();
+const int8_t* k_nvfp4_act_odd();
+const float*  k_nvfp4_act_scale();
 
 // 传进来的 Q 已按 (行, 128 维组) 量化；KV 已在打包格式里；out [n_q][HD] f32
 // n_q 是按 64 补齐后的行数（决定 Q/out 的头内偏移），n_row 是真实 query 行数；

@@ -12,6 +12,17 @@
 | `group_0` | `float-quantized`（FP8 E4M3，权重逐通道、激活逐 token） | 注意力投影、线性注意力投影、`lm_head`、第 56~63 层 MLP |
 | `group_1` | `nvfp4-pack-quantized` | **所有 MLP 的 `gate/up/down_proj`** |
 
+也就是说 checkpoint 里只有 MLP 是原生 NVFP4，其余线性层是 FP8 逐通道。本项目把
+那 233 个 FP8 线性层（`self_attn.q/k/v/o_proj`、`linear_attn.in_proj_qkv/in_proj_z/
+out_proj`、`lm_head`、第 56~63 层 MLP）**按下面这份完全相同的规格**重量化成 NVFP4
+（工具：`tools/nvfp4_quant.py`，见 [BENCHLOG.md](BENCHLOG.md) 的性能权衡）：
+
+```
+gscale      = 448 * 6 / amax(W)          逐张量 F32（与 checkpoint 的取值逐位对齐）
+scale[n,b]  = e4m3(block_amax / 6 * gscale)      每 16 个 k 一组
+code        = 最接近 E2M1 格点的整数码
+```
+
 扫一遍 safetensors 头部的统计（`tools/nvfp4_layout.py`）：
 
 ```

@@ -46,16 +46,23 @@ type  part  name  kind  N  K  group  off  nbytes  soff  gscale
 ## 里面装了什么
 
 ```
-main    851 个  = 主模型全部张量，但**减掉**被 NVFP4 取代的 168 个 MLP 张量
-                  （这 168 个仍留一条 0 字节的元数据行，因为运行时还要查它们的 N/K）
-nvfp4   336 个  = 168 个 weight_packed + 168 个 weight_scale
+main    851 个  = 主模型全部张量，但**减掉**被 NVFP4 取代的 401 个线性层张量
+                  （168 个 MLP 是 checkpoint 原生 NVFP4；注意力/线性注意力投影、
+                  lm_head、第 56~63 层 MLP 共 233 个由 tools/nvfp4_quant.py 从
+                  FP8 按同一规格重量化。这 401 个仍各留一条 0 字节的元数据行，
+                  因为运行时还要查它们的 N/K）
+nvfp4   802 个  = 401 个 weight_packed + 401 个 weight_scale
 mtp      15 个
 visual  333 个
 ```
 
-合计 1535 条索引、15.765 GB 载荷。原来分散在 4 个文件里
+合计 2001 条索引、16.263 GB 载荷。原来分散在 4 个文件里
 （`qwen38_27b.rt4` 13.91 + `_mtp.rt4` 0.22 + `_vision.rt4` 0.93 + `model.safetensors` 22.57 GB），
-打包时把被取代的 7.72 GB MLP 整段丢掉。
+打包时把被取代的 13.2 GB int4 整段丢掉（换成 13.7 GB 的 NVFP4 权重+尺度）。
+
+只让 MLP 走 NVFP4（其余线性层留 RT4 int4）的打包方式见
+`NVFP4_ALL=0 bash scripts/pack_weights.sh`：索引 1535 条 / 15.765 GB。
+两种布局的性能差异见 [BENCHLOG.md](BENCHLOG.md)。
 
 ## 运行时怎么用
 

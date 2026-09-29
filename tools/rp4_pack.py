@@ -6,7 +6,9 @@
 
     读头 -> 读索引 -> 从头到尾顺序读载荷（O_DIRECT）-> 完
 
-主模型里被 NVFP4 取代的那 168 个 MLP 张量在打包时整段丢掉（既省空间也省 I/O）。
+主模型里被 NVFP4 取代的张量在打包时整段丢掉（既省空间也省 I/O）：168 个 MLP 是
+checkpoint 原生 NVFP4；注意力 / 线性注意力投影、lm_head、第 56~63 层 MLP 由
+tools/nvfp4_quant.py 从 FP8 按同一规格重量化（--nvfp4-extra）。
 MTP 头（`mtp.`）和视觉塔（`model.visual.`）也一起装进来，运行时不再需要
 任何别的权重文件。
 
@@ -15,6 +17,7 @@ MTP 头（`mtp.`）和视觉塔（`model.visual.`）也一起装进来，运行�
         --mtp   <qwen38_27b_mtp.rt4>    --mtp-json   <qwen38_27b_mtp.rt4.json> \\
         --vision <qwen38_27b_vision.rt4> --vision-json <qwen38_27b_vision.rt4.json> \\
         --nvfp4 <model.safetensors> --nvfp4-tsv <nvfp4_manifest.tsv> \\
+        --nvfp4-extra <nvfp4_extra_blob.bin> --nvfp4-extra-tsv <nvfp4_extra_manifest.tsv> \\
         --out <model.rp4>
 """
 import argparse
@@ -42,7 +45,7 @@ def tensor_group(n):
     return 66
 
 
-def read_nvfp4_tsv(path):
+def read_nvfp4_tsv(path, src='nv'):
     rows = []
     with open(path) as f:
         for line in f:
@@ -51,7 +54,7 @@ def read_nvfp4_tsv(path):
             p = line.split()
             rows.append(dict(stem=p[0], poff=int(p[1]), pbytes=int(p[2]),
                              soff=int(p[3]), sbytes=int(p[4]), gscale=float(p[5]),
-                             N=int(p[6]), K=int(p[7])))
+                             N=int(p[6]), K=int(p[7]), src=src))
     return rows
 
 
@@ -62,10 +65,23 @@ def main():
         ap.add_argument('--%s-json' % k, required=True)
     ap.add_argument('--nvfp4', required=True)
     ap.add_argument('--nvfp4-tsv', required=True)
+    # 额外一份「从 FP8 重量化出来的 NVFP4」（tools/nvfp4_quant.py 的产物）：
+    # 注意力/线性注意力投影、lm_head、第 56~63 层 MLP。载荷单独一个 blob。
+    ap.add_argument('--nvfp4-extra')
+    ap.add_argument('--nvfp4-extra-tsv')
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
 
-    nv = read_nvfp4_tsv(a.nvfp4_tsv)
+    nv = read_nvfp4_tsv(a.nvfp4_tsv, 'nv')
+    if a.nvfp4_extra:
+        if not a.nvfp4_extra_tsv:
+            sys.exit('--nvfp4-extra 需要同时给 --nvfp4-extra-tsv')
+        have = {r['stem'] for r in nv}
+        extra = read_nvfp4_tsv(a.nvfp4_extra_tsv, 'nve')
+        for r in extra:
+            if r['stem'] in have:
+                sys.exit('extra 清单与主清单重复：%s' % r['stem'])
+        nv += extra
     nv_stems = {r['stem'] for r in nv}
 
     # items: (group, type, part, name, kind, N, K, grp, src, src_off, bytes, gscale, sdelta)
@@ -90,9 +106,9 @@ def main():
     for r in nv:
         g = tensor_group(r['stem'])
         items.append((g, 'nvp', 'main', r['stem'], 'nvfp4', r['N'], r['K'], 16,
-                      'nv', r['poff'], r['pbytes'], r['gscale'], 0))
+                      r['src'], r['poff'], r['pbytes'], r['gscale'], 0))
         items.append((g, 'nvs', 'main', r['stem'], 'nvfp4', r['N'], r['K'], 16,
-                      'nv', r['soff'], r['sbytes'], r['gscale'], 0))
+                      r['src'], r['soff'], r['sbytes'], r['gscale'], 0))
 
     for part, jpath, src in (('mtp', a.mtp_json, 'mtp'), ('visual', a.vision_json, 'vision')):
         grp = 67 if part == 'mtp' else 68
@@ -137,6 +153,8 @@ def main():
 
     srcs = {'main': open(a.main, 'rb'), 'mtp': open(a.mtp, 'rb'),
             'vision': open(a.vision, 'rb'), 'nv': open(a.nvfp4, 'rb')}
+    if a.nvfp4_extra:
+        srcs['nve'] = open(a.nvfp4_extra, 'rb')
     t0 = time.time()
     with open(a.out, 'wb') as out:
         out.write(hdr)

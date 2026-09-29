@@ -38,6 +38,11 @@ static void quant_act16(const float* x, int rows, int K) {
     if (hipGetLastError() != hipSuccess) { printf("nvfp4 quant_act16 launch fail\n"); exit(1); }
 }
 
+// 诊断用（NVCHK）：把最近一次量化出来的激活码/尺度交出来对拍
+const int8_t* k_nvfp4_act_even() { return s_ae; }
+const int8_t* k_nvfp4_act_odd()  { return s_ao; }
+const float*  k_nvfp4_act_scale() { return s_as; }
+
 // -------------------------------------------------------------- 解码 GEMV --
 void k_nvfp4_gemv(float* y, const void* wp, const void* ws, float inv_gscale,
                   const float* x, int rows, int N, int K) {

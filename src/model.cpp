@@ -154,6 +154,26 @@ struct RT4 {
     const uint8_t* hptr(long long off) const { return map + off; }
 };
 
+// 把（十几 GB 的）权重文件映射进主机地址空间。
+//
+// 为什么要自己挑地址：内核默认会把这么大的映射放到 mmap 区的**顶部**（0x7fff…
+// 附近），而载荷里的张量偏移可能有几个 GB —— base + off 一旦越过 47 位（一个
+// 「非规范地址」，比如 0x8000_03xx_xxxx），CPU 一读就是 SIGSEGV。实测 .rp4 稍微
+// 换个大小就会踩到（同一个张量前一天好好的，换包后就崩）。
+// 这里显式给一个低位地址做提示，并校验「base + 长度」仍落在规范区间里。
+static void* map_weights(int fd, size_t n) {
+    for (unsigned long long hint = 0x200000000000ULL; hint >= 0x1000000000ULL; hint >>= 1) {
+        void* p = mmap((void*)hint, n, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (p != MAP_FAILED) {
+            if ((unsigned long long)p + n <= 0x7FFFFFFFFFFFULL) return p;
+            munmap(p, n);                      // 提示被忽略、还是落在高位 → 再试更低的
+        }
+    }
+    void* p = mmap(nullptr, n, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) { printf("mmap 权重大文件失败（%.2f GB）\n", n / 1e9); exit(1); }
+    return p;
+}
+
 static std::string read_file(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) { printf("无法打开 %s\n", p.c_str()); exit(1); }
@@ -191,8 +211,7 @@ void RT4::load(const std::string& path, const std::string& json) {
     struct stat st{};
     fstat(fd, &st);
     map_size = (size_t)st.st_size;
-    map = (const uint8_t*)mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map == MAP_FAILED) { printf("mmap 失败 %s\n", path.c_str()); exit(1); }
+    map = (const uint8_t*)map_weights(fd, map_size);
     printf("RT4: %zu 张量, %.2f GB (mmap)\n", tensors.size(), map_size / 1e9);
 }
 
@@ -335,8 +354,7 @@ static bool rp4_open(Rp4& r, const std::string& path) {
         r.rows.push_back(row);
     }
     // mmap 出来给主机侧读（prep_gm 的尺度、F() 的 f16/f32）
-    r.map = (const uint8_t*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (r.map == MAP_FAILED) { printf(".rp4 mmap 失败\n"); close(fd); return false; }
+    r.map = (const uint8_t*)map_weights(fd, st.st_size);
     r.map_size = st.st_size;
     close(fd);
     r.ok = true;
@@ -1135,6 +1153,41 @@ struct EmbSpan {
     int count;
 };
 
+// NVFP4 权重挂在哪个线性层上。MLP 那 3 个是 checkpoint 原生 NVFP4；
+// 其余（注意力/线性注意力投影、lm_head、第 56~63 层 MLP）由 tools/nvfp4_quant.py
+// 从 FP8 按同一规格重量化而来（见该文件头）。
+enum NvSlot {
+    NV_MLP_GATE = 0, NV_MLP_UP, NV_MLP_DOWN,
+    NV_Q, NV_K, NV_V, NV_O,
+    NV_IN_QKV, NV_IN_Z, NV_OUT, NV_LMHEAD, NV_NONE = -1,
+};
+struct NvRow { int layer, slot; size_t poff, pbytes, soff, sbytes; float gs; int N, K;
+               std::string name;                    // 去掉 .weight_packed/.weight 的名字
+};
+
+// 名字 → (层号, 槽位)。layer = -1 表示没有层号的全局权重（lm_head）。
+static bool nv_parse(const std::string& name, int* layer, int* slot) {
+    *layer = -1;
+    *slot = NV_NONE;
+    const size_t p = name.find(".layers.");
+    if (p != std::string::npos) *layer = atoi(name.c_str() + p + 8);
+    struct { const char* pat; int slot; } tab[] = {
+        {".mlp.gate_proj", NV_MLP_GATE}, {".mlp.up_proj", NV_MLP_UP},
+        {".mlp.down_proj", NV_MLP_DOWN},
+        {".self_attn.q_proj", NV_Q}, {".self_attn.k_proj", NV_K},
+        {".self_attn.v_proj", NV_V}, {".self_attn.o_proj", NV_O},
+        {".linear_attn.in_proj_qkv", NV_IN_QKV}, {".linear_attn.in_proj_z", NV_IN_Z},
+        {".linear_attn.out_proj", NV_OUT},
+    };
+    for (const auto& e : tab)
+        if (name.find(e.pat) != std::string::npos) { *slot = e.slot; break; }
+    if (*slot == NV_NONE && name.find("lm_head") != std::string::npos) {
+        *slot = NV_LMHEAD;
+        *layer = -1;
+    }
+    return *slot != NV_NONE && (*layer >= 0 || *slot == NV_LMHEAD);
+}
+
 struct Model {
     Cfg cfg;
     RT4 rt;
@@ -1256,6 +1309,14 @@ struct Model {
     // T 行 × N 输出的线性层：M 小走 GEMV，M 大走 GEMM（a 已经是量化好的 int4）
     void linear(float* y, const Wq& w, const float* x, int M);
     void linear_quant(float* y, const Wq& w, const float* x, int M, u32* aq, float* asc, int row_stride, int row_off);
+    // 把 NVFP4 权重挂到各线性层（MLP/注意力/线性注意力/lm_head）上，见实现处
+    Wq* wq_at(int layer, int slot);              // (层号, 槽位) → 线性层权重
+    Wq* find_wq(const std::string& name);        // 按名字找（NVCHK 诊断用）
+    void lm_head_gemv(float* y, const float* x, int rows);   // lm_head 的 GEMV 分派
+    void attach_nvfp4(const std::vector<NvRow>& rows, Prefetch& pf, int file,
+                      const std::map<std::string, size_t>* nvp = nullptr,
+                      const std::map<std::string, size_t>* nvs = nullptr,
+                      uint8_t* dev = nullptr);
 };
 
 // 取权重（名字带上语言模型的完整前缀）
@@ -1271,16 +1332,6 @@ static std::string tn(int il, const char* suffix) {
 // weight_global_scale），原封不动搬进显存，交给 k_nvfp4_* 内核。
 // 张量偏移来自 tools/nvfp4_layout.py 产出的 TSV，所以 C++ 侧
 // 不需要解析 safetensors 的 JSON。
-struct NvRow { int layer, which; size_t poff, pbytes, soff, sbytes; float gs; int N, K; };
-
-// NVFP4 张量的名字（去掉 .weight_packed / .weight_scale 后缀）
-static std::string nv_stem(const NvRow& r) {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "model.language_model.layers.%d.mlp.%s", r.layer,
-             r.which == 0 ? "gate_proj" : r.which == 1 ? "up_proj" : "down_proj");
-    return buf;
-}
-
 // 只读清单（不碰权重），好在 rt.load() 之前就知道该跳过哪些 RT4 张量
 static std::vector<NvRow> read_nvfp4_rows(const std::string& manifest, int n_layer) {
     std::vector<NvRow> rows;
@@ -1294,54 +1345,86 @@ static std::vector<NvRow> read_nvfp4_rows(const std::string& manifest, int n_lay
         NvRow r{};
         ss >> name >> r.poff >> r.pbytes >> r.soff >> r.sbytes >> r.gs >> r.N >> r.K;
         if (!ss) continue;
-        const size_t p = name.find(".layers.");
-        if (p == std::string::npos) continue;
-        r.layer = atoi(name.c_str() + p + 8);
-        if (name.find(".mlp.gate_proj") != std::string::npos) r.which = 0;
-        else if (name.find(".mlp.up_proj") != std::string::npos) r.which = 1;
-        else if (name.find(".mlp.down_proj") != std::string::npos) r.which = 2;
-        else continue;
+        if (!nv_parse(name, &r.layer, &r.slot)) continue;
+        r.name = name;
         if (r.layer >= n_layer) continue;
         rows.push_back(r);
     }
     return rows;
 }
 
-// 这些 RT4 张量会被 NVFP4 版本取代，上传时可以整段跳过
+// 这些 RT4 张量会被 NVFP4 版本取代，上传/准备 GEMM 尺度时可以整段跳过
 static std::set<std::string> nvfp4_skip_names(const std::vector<NvRow>& rows) {
     std::set<std::string> s;
-    for (const NvRow& r : rows) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "model.language_model.layers.%d.mlp.%s.weight", r.layer,
-                 r.which == 0 ? "gate_proj" : r.which == 1 ? "up_proj" : "down_proj");
-        s.insert(buf);
-    }
+    for (const NvRow& r : rows) s.insert(r.name + ".weight");
     return s;
 }
 
-// 把 NVFP4 权重挂到 MLP 上。
+// 把 NVFP4 权重挂到对应的线性层上（MLP / 注意力 / 线性注意力 / lm_head）。
 //   packed == nullptr：各自 malloc，并登记进预取器（按层加载）
 //   packed != nullptr：权重已经在打包文件的 dev 缓冲里，直接按索引贴指针
-static void attach_nvfp4_mlp(std::vector<Layer>& layers, const std::vector<NvRow>& rows,
-                             Prefetch& pf, int file,
-                             const std::map<std::string, size_t>* nvp = nullptr,
-                             const std::map<std::string, size_t>* nvs = nullptr,
-                             uint8_t* dev = nullptr) {
+// (层号, 槽位) → 对应的线性层权重
+Wq* Model::wq_at(int layer, int slot) {
+    if (slot == NV_LMHEAD) return &lm_head;
+    if (layer < 0 || layer >= (int)layers.size()) return nullptr;
+    Layer& L = layers[layer];
+    switch (slot) {
+        case NV_MLP_GATE: return &L.mlp_gate;
+        case NV_MLP_UP:   return &L.mlp_up;
+        case NV_MLP_DOWN: return &L.mlp_down;
+        case NV_Q:        return &L.q_proj;
+        case NV_K:        return &L.k_proj;
+        case NV_V:        return &L.v_proj;
+        case NV_O:        return &L.o_proj;
+        case NV_IN_QKV:   return &L.in_qkv;
+        case NV_IN_Z:     return &L.in_z;
+        case NV_OUT:      return &L.out_proj;
+        default:          return nullptr;
+    }
+}
+
+Wq* Model::find_wq(const std::string& name) {
+    std::string full = name;
+    if (full.rfind("layers.", 0) == 0) full = "model.language_model." + full;
+    int layer = -1, slot = NV_NONE;
+    if (!nv_parse(full, &layer, &slot)) return nullptr;
+    return wq_at(layer, slot);
+}
+
+// lm_head 的 GEMV：NVFP4（由 tools/nvfp4_quant.py 从 FP8 重量化）或 RT4 int4。
+// 注意 MTP 的草稿 logits 也走这里 —— 它的 int4 数据在 .rp4 里是被丢掉的，
+// 所以每个调用点都必须经过这个分派（早期漏改一处，MTP 接受率直接掉到 0）。
+void Model::lm_head_gemv(float* y, const float* x, int rows) {
+    if (lm_head.has_nvfp4()) {
+        if (rows > 4) { printf("lm_head: rows=%d > 4\n", rows); exit(1); }
+        k_nvfp4_gemv(y, lm_head.nvp, lm_head.nvs, 1.f / lm_head.nvgs, x, rows,
+                     lm_head.N, lm_head.K);
+        return;
+    }
+    static const int act4 = getenv("RT_ACT4") ? atoi(getenv("RT_ACT4")) : 0;
+    if (act4) k_gemv_w4a4(y, lm_head.q, lm_head.s, x, rows, lm_head.N, lm_head.K);
+    else      k_gemv_w4a8(y, lm_head.q, lm_head.s, x, rows, lm_head.N, lm_head.K);
+}
+
+void Model::attach_nvfp4(const std::vector<NvRow>& rows, Prefetch& pf, int file,
+                         const std::map<std::string, size_t>* nvp,
+                         const std::map<std::string, size_t>* nvs,
+                         uint8_t* dev) {
     if (rows.empty()) return;
     size_t tot = 0;
+    int n_lin = 0;
     for (const NvRow& r : rows) {
-        Wq* w = r.which == 0 ? &layers[r.layer].mlp_gate
-               : r.which == 1 ? &layers[r.layer].mlp_up : &layers[r.layer].mlp_down;
+        Wq* w = wq_at(r.layer, r.slot);
+        if (!w) continue;
         if (w->N != r.N || w->K != r.K) {
-            printf("NVFP4: 形状不符 layer %d which %d: RT4 %dx%d vs NVFP4 %dx%d\n",
-                   r.layer, r.which, w->N, w->K, r.N, r.K);
+            printf("NVFP4: 形状不符 %s: RT4 %dx%d vs NVFP4 %dx%d\n",
+                   r.name.c_str(), w->N, w->K, r.N, r.K);
             exit(1);
         }
         if (nvp) {
-            const std::string stem = nv_stem(r);
-            auto a = nvp->find(stem), b = nvs->find(stem);
+            auto a = nvp->find(r.name), b = nvs->find(r.name);
             if (a == nvp->end() || b == nvs->end()) {
-                printf("NVFP4: 打包索引里缺 %s\n", stem.c_str());
+                printf("NVFP4: 打包索引里缺 %s\n", r.name.c_str());
                 exit(1);
             }
             w->nvp = (const u32*)(dev + a->second);
@@ -1357,9 +1440,9 @@ static void attach_nvfp4_mlp(std::vector<Layer>& layers, const std::vector<NvRow
         }
         w->nvgs = r.gs;
         tot += r.pbytes + r.sbytes;
+        n_lin++;
     }
-    printf("NVFP4: %zu 个 MLP 张量改为直跑（%.3f GB，权重零误差）\n",
-           rows.size(), tot / 1e9);
+    printf("NVFP4: %d 个线性层权重改为直跑（%.3f GB）\n", n_lin, tot / 1e9);
 }
 
 void Model::init(const std::string& path, const std::string& json) {
@@ -1390,26 +1473,21 @@ void Model::init(const std::string& path, const std::string& json) {
         for (const Rp4Row& row : rp4.rows) {
             if (row.type == "nvp") {
                 nvp_off[row.name] = row.off;
-                // 顺带把 NVFP4 的层号/投影/形状凑出来给 attach 用
-                const size_t d = row.name.find(".layers.");
-                if (d == std::string::npos) continue;
                 NvRow r{};
-                r.layer = atoi(row.name.c_str() + d + 8);
-                if (row.name.find(".mlp.gate_proj") != std::string::npos) r.which = 0;
-                else if (row.name.find(".mlp.up_proj") != std::string::npos) r.which = 1;
-                else if (row.name.find(".mlp.down_proj") != std::string::npos) r.which = 2;
-                else continue;
+                if (!nv_parse(row.name, &r.layer, &r.slot)) continue;
+                if (r.layer >= cfg.n_layer) continue;
+                r.name = row.name;
                 r.N = row.N; r.K = row.K; r.gs = row.gscale;
                 r.pbytes = row.bytes;            // 只用于打印体积
                 nv_rows.push_back(r);
             } else if (row.type == "nvs") {
                 nvs_off[row.name] = row.off;
                 for (NvRow& nv : nv_rows)
-                    if (nv_stem(nv) == row.name) nv.sbytes = row.bytes;
+                    if (nv.name == row.name) nv.sbytes = row.bytes;
             }
         }
         std::sort(nv_rows.begin(), nv_rows.end(), [](const NvRow& a, const NvRow& b) {
-            return a.layer != b.layer ? a.layer < b.layer : a.which < b.which; });
+            return a.layer != b.layer ? a.layer < b.layer : a.slot < b.slot; });
         nvfp4_names = nvfp4_skip_names(nv_rows);   // prep_gm 要靠它跳过被取代的权重
         // 线性预取：整段载荷从 0 顺序读，跨过分组边界时记事件
         std::map<int, size_t> gend;
@@ -1594,16 +1672,16 @@ void Model::init(const std::string& path, const std::string& json) {
     }
     lm_head.s_gm = gm_dev[rt.index["lm_head.weight"]];
 
-    // ---- 混合模式：把 MLP 的原始 NVFP4 权重挂上去（同样只登记，不拷贝）----
+    // ---- 把 NVFP4 权重挂到所有线性层上（同样只登记，不拷贝）----
     if (!nv_rows.empty()) {
         if (rp4_used) {
             // .rp4 里已经排好，直接贴指针（dev 就是那段载荷）
-            attach_nvfp4_mlp(layers, nv_rows, pf, -1, &nvp_off, &nvs_off, rt.dev);
+            attach_nvfp4(nv_rows, pf, -1, &nvp_off, &nvs_off, rt.dev);
         } else if (!pack_rows.empty()) {
-            attach_nvfp4_mlp(layers, nv_rows, pf, f_rt, &nvp_off, &nvs_off, rt.dev);
+            attach_nvfp4(nv_rows, pf, f_rt, &nvp_off, &nvs_off, rt.dev);
         } else {
             const int f_nv = pf.add_file(nv_st.c_str());
-            attach_nvfp4_mlp(layers, nv_rows, pf, f_nv);
+            attach_nvfp4(nv_rows, pf, f_nv);
         }
     }
 
@@ -2130,14 +2208,10 @@ void Model::forward(const int* ids, int n, bool log_last, int log_rows, bool ext
       static const int act4 = getenv("RT_ACT4") ? atoi(getenv("RT_ACT4")) : 0;
       if (log_rows > 0) {
           if (log_rows > 4) { printf("forward: log_rows=%d > 4\n", log_rows); exit(1); }
-          if (act4) k_gemv_w4a4(d.logits_all, lm_head.q, lm_head.s, d.h_norm, log_rows,
-                                lm_head.N, lm_head.K);
-          else      k_gemv_w4a8(d.logits_all, lm_head.q, lm_head.s, d.h_norm, log_rows,
-                                lm_head.N, lm_head.K);
+          lm_head_gemv(d.logits_all, d.h_norm, log_rows);
       } else if (log_last) {
           const float* last = d.h_norm + (size_t)(n - 1) * cfg.hidden;
-          if (act4) k_gemv_w4a4(d.logits, lm_head.q, lm_head.s, last, 1, lm_head.N, lm_head.K);
-          else      k_gemv_w4a8(d.logits, lm_head.q, lm_head.s, last, 1, lm_head.N, lm_head.K);
+          lm_head_gemv(d.logits, last, 1);
       } }
     if (mtp_on && extend_mtp) {
         ProfTick _t(pa(P_MTP));
@@ -2245,10 +2319,7 @@ void Model::mtp_layer_rows(const int* ids_dev, const float* hin, int rows, int p
         const int act4 = getenv("RT_ACT4") ? atoi(getenv("RT_ACT4")) : 0;
         {
             ProfTick _t(pa(P_HEAD));
-            if (act4) k_gemv_w4a4(d.mtp_logits, lm_head.q, lm_head.s, d.mtp_out, 1,
-                                  lm_head.N, lm_head.K);
-            else      k_gemv_w4a8(d.mtp_logits, lm_head.q, lm_head.s, d.mtp_out, 1,
-                                  lm_head.N, lm_head.K);
+            lm_head_gemv(d.mtp_logits, d.mtp_out, 1);   // MTP 草稿 logits 也用 lm_head
         }
         { ProfTick _t(pa(P_SAMPLE)); if (argmax_out) k_argmax(d.mtp_logits, 248320, argmax_out); }
     }
@@ -2912,6 +2983,58 @@ static void engine_loop(Model& m) {
             m.mtp_n = std::max(0, std::min(3, atoi(arg.c_str())));
             printf("OK mtp %d%s\n", m.mtp_n, m.mtp_on ? "" : " (no weights)");
             fflush(stdout);
+        } else if (op == "NVCHK") {
+            // 诊断：某个线性层的 NVFP4 权重 + 激活 + 内核输出一起导出到 /tmp/nvchk_*.bin，
+            // 用 tools/nvfp4_ref.py 的参考实现逐元素对拍（定位数据/layout/内核哪一层出问题）。
+            std::string nm = arg, how = "ramp";
+            const size_t sp2 = arg.find(' ');
+            if (sp2 != std::string::npos) { nm = arg.substr(0, sp2); how = arg.substr(sp2 + 1); }
+            const Wq* w = m.find_wq(nm);
+            if (!w || !w->has_nvfp4()) {
+                printf("ERR NVCHK: %s 没有 NVFP4 权重\n", nm.c_str());
+            } else {
+                const int N = w->N, K = w->K;
+                const int NR = std::min(N, 4096);          // 只对拍前 NR 行，文件别太大
+                std::vector<float> x(K);
+                if (how == "real")
+                    CK(hipMemcpy(x.data(), m.d.h_norm, (size_t)K * 4, hipMemcpyDeviceToHost));
+                else
+                    for (int i = 0; i < K; i++) x[i] = 0.02f * sinf(i * 0.017f) + 0.013f * cosf(i * 0.0031f);
+                float *xd = nullptr, *yd = nullptr;
+                CK(hipMalloc(&xd, (size_t)K * 4));
+                CK(hipMalloc(&yd, (size_t)N * 4));
+                CK(hipMemcpy(xd, x.data(), (size_t)K * 4, hipMemcpyHostToDevice));
+                k_nvfp4_gemv(yd, w->nvp, w->nvs, 1.f / w->nvgs, xd, 1, N, K);
+                CK(hipDeviceSynchronize());
+                std::vector<float> y(NR);
+                std::vector<uint8_t> wp((size_t)NR * K / 2), ws((size_t)NR * K / 16);
+                CK(hipMemcpy(y.data(), yd, (size_t)NR * 4, hipMemcpyDeviceToHost));
+                CK(hipMemcpy(wp.data(), w->nvp, wp.size(), hipMemcpyDeviceToHost));
+                CK(hipMemcpy(ws.data(), w->nvs, ws.size(), hipMemcpyDeviceToHost));
+                auto wr = [](const char* p, const void* d, size_t n) {
+                    FILE* f = fopen(p, "wb");
+                    if (!f) { printf("ERR NVCHK: 写不了 %s\n", p); return; }
+                    fwrite(d, 1, n, f); fclose(f);
+                };
+                wr("/tmp/nvchk_x.bin", x.data(), x.size() * 4);
+                wr("/tmp/nvchk_y.bin", y.data(), y.size() * 4);
+                wr("/tmp/nvchk_wp.bin", wp.data(), wp.size());
+                wr("/tmp/nvchk_ws.bin", ws.data(), ws.size());
+                {   // 激活量化结果也导出来（偶 k / 奇 k / 每 16 一组尺度）
+                    std::vector<int8_t> ae((size_t)K / 2), ao((size_t)K / 2);
+                    std::vector<float> asc((size_t)K / 16);
+                    CK(hipMemcpy(ae.data(), k_nvfp4_act_even(), ae.size(), hipMemcpyDeviceToHost));
+                    CK(hipMemcpy(ao.data(), k_nvfp4_act_odd(), ao.size(), hipMemcpyDeviceToHost));
+                    CK(hipMemcpy(asc.data(), k_nvfp4_act_scale(), asc.size() * 4, hipMemcpyDeviceToHost));
+                    wr("/tmp/nvchk_ae.bin", ae.data(), ae.size());
+                    wr("/tmp/nvchk_ao.bin", ao.data(), ao.size());
+                    wr("/tmp/nvchk_asc.bin", asc.data(), asc.size() * 4);
+                }
+                printf("OK nvchk %s N=%d K=%d rows=%d gscale=%.9g\n",
+                       nm.c_str(), N, K, NR, w->nvgs);
+                hipFree(xd); hipFree(yd);
+            }
+            fflush(stdout);
         } else if (op == "PREFILL") {
             const std::vector<int> ids = parse_ids(arg);
             run_prefill(ids, nullptr, 0);
@@ -3279,8 +3402,7 @@ static void engine_loop(Model& m) {
                     m.mtp_linear(m.d.m_up, m.mtp.mlp_up, m.mtp.mlp_up_lo, m.d.xb, 1);
                     m.mtp_linear(m.d.gz, m.mtp.mlp_down, m.mtp.mlp_down_lo, m.d.m_gate, 1);
                     if (mb_head)
-                        k_gemv_w4a8(m.d.mtp_logits, m.lm_head.q, m.lm_head.s,
-                                    m.d.mtp_out, 1, m.lm_head.N, m.lm_head.K);
+                        m.lm_head_gemv(m.d.mtp_logits, m.d.mtp_out, 1);
                 } else if (mb_head) {
                     m.mtp_draft_chain(mb_tok, m.d.mtp_out, 1, mb_out);
                 } else {

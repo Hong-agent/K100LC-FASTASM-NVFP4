@@ -42,6 +42,7 @@ run test_ws_quota         env PYTHONPATH="$RT_PY_DEPS${PYTHONPATH:+:$PYTHONPATH}
                               "$RT_PYTHON" tests/test_ws_quota.py
 run test_bench            python3 tests/test_bench.py
 run test_kv_pool          python3 tests/test_kv_pool.py
+run test_nvfp4_quant      python3 tests/test_nvfp4_quant.py
 
 echo "== HSA 运行时（需要 DCU）=="
 run test_hsa_runtime      python3 tests/test_hsa_runtime.py
