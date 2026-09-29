@@ -175,7 +175,9 @@ def _conv_prefix_ids(conv, msgs, kw):
         return None
     with _CONV_KV_LOCK:
         st = _CONV_KV.get(conv)
-    if not st:
+    # epoch 不匹配 = 提交这条前缀的引擎实例已被自动重启替换（见 Engine.ensure），
+    # 它的 KV 已随进程消失，前缀作废、整段重算。
+    if not st or st.get('epoch') != (ENGINE.epoch if ENGINE else 0):
         return None
     keys = [_conv_msg_key(m) for m in msgs]
     n = len(st['keys'])
@@ -199,7 +201,8 @@ def _conv_kv_commit(conv, msgs, ids, toks, answer):
         return
     keys = [_conv_msg_key(m) for m in msgs] + [('assistant', answer or '')]
     with _CONV_KV_LOCK:
-        _CONV_KV[conv] = {'keys': keys, 'ids': list(ids) + list(toks)}
+        _CONV_KV[conv] = {'keys': keys, 'ids': list(ids) + list(toks),
+                          'epoch': ENGINE.epoch if ENGINE else 0}
         while len(_CONV_KV) > _CONV_KV_MAX:
             _CONV_KV.pop(next(iter(_CONV_KV)))
 WEB_INDEX = os.path.join(ROOT, 'web', 'index.html')
@@ -778,7 +781,10 @@ def clamp_max_tokens(prompt_len, n):
 @app.get('/health')
 def health():
     return {'ok': True, 'model': MODEL_NAME, 'mtp': getattr(ENGINE, 'mtp_n', None),
-            'vision': _vision_ready(), 'vision_backend': _vision_backend(), **STATS}
+            'vision': _vision_ready(), 'vision_backend': _vision_backend(),
+            'engine_alive': bool(ENGINE and ENGINE.alive()),
+            'engine_epoch': getattr(ENGINE, 'epoch', None),
+            'engine_restarts': getattr(ENGINE, 'restarts', 0), **STATS}
 
 
 @app.get('/')
@@ -973,15 +979,27 @@ def _write_embeddings_file(embeds):
     return path
 
 
+async def _engine_prefill(ids, embeds, emb_path, spans):
+    """prefill 的崩溃自愈版：引擎子进程死掉（驱动故障/OOM/内核越界）时先
+    Engine.ensure() 重新拉起，再全量重试一次。重启后引擎 KV 清零，prefill
+    本身幂等（自动整段重算），重试是安全的；再失败就原样抛出。"""
+    for attempt in (0, 1):
+        try:
+            if embeds:
+                return await asyncio.to_thread(ENGINE.prefill_emb, ids, emb_path, spans)
+            return await asyncio.to_thread(ENGINE.prefill, ids)
+        except RuntimeError as e:
+            if attempt or '引擎' not in str(e):
+                raise
+            await asyncio.to_thread(ENGINE.ensure)      # 死了 → 重启 → 重试一次
+
+
 async def _prefill_with(ids, embeds):
     """按需把视觉 embedding 写临时文件并执行 PREFILL / PREFILL_EMB。"""
     spans = _image_token_spans(ids, embeds) if embeds else []
     emb_path = _write_embeddings_file(embeds) if embeds else None
     try:
-        if embeds:
-            st = await asyncio.to_thread(ENGINE.prefill_emb, ids, emb_path, spans)
-        else:
-            st = await asyncio.to_thread(ENGINE.prefill, ids)
+        st = await _engine_prefill(ids, embeds, emb_path, spans)
     finally:
         if emb_path:
             try:
@@ -1038,20 +1056,47 @@ def _file_list(conv):
     return files
 
 
+# 工作区已用量核算：增量缓存 + 定期校准，替代每次写文件的全目录扫描
+# （文件多时是 O(文件数) 写放大）。写/删只有 _write_file/_delete_file 两个入口
+# （asyncio 单线程 + 请求全程持全局锁，实际无并发写）；漂移由每 50 次写一次的
+# 全量扫描兜底，文件系统仍是事实源。
+_WS_USED = {}                     # conv -> [已用字节, 距上次校准的写次数]
+_WS_RECAL_EVERY = 50
+
+
+def _ws_scan_used(conv):
+    root = _workspace(conv)
+    return sum(os.path.getsize(os.path.join(root, f))
+               for f in os.listdir(root)
+               if os.path.isfile(os.path.join(root, f)))
+
+
+def _ws_used(conv):
+    """取 (增量维护的) 工作区已用量，惰性初始化 + 定期校准。"""
+    st = _WS_USED.get(conv)
+    if st is None:
+        _WS_USED[conv] = st = [_ws_scan_used(conv), 0]
+    elif st[1] >= _WS_RECAL_EVERY:
+        st[0], st[1] = _ws_scan_used(conv), 0
+    return st
+
+
 def _write_file(conv, name, content, append=False):
     path = _file_path(conv, name)
     data = str(content).encode('utf-8')
     if len(data) > MAX_FILE_BYTES:
         raise ValueError(f'文件超过 {MAX_FILE_BYTES // 1024}KB 上限')
-    used = sum(os.path.getsize(os.path.join(_workspace(conv), f))
-               for f in os.listdir(_workspace(conv))
-               if os.path.isfile(os.path.join(_workspace(conv), f)))
+    used = _ws_used(conv)
     old = os.path.getsize(path) if os.path.exists(path) else 0
-    if used - old + len(data) > MAX_WORKSPACE_BYTES:
+    # 写后的工作区总量：覆盖写替换掉 old，追加在 old 之上累加（不减 old）。
+    after = used[0] + len(data) if append else used[0] - old + len(data)
+    if after > MAX_WORKSPACE_BYTES:
         raise ValueError(f'工作区超过 {MAX_WORKSPACE_BYTES // 1024 // 1024}MB 上限')
     mode = 'ab' if append else 'wb'
     with open(path, mode) as f:
         f.write(data)
+    used[0] += len(data) if append else len(data) - old
+    used[1] += 1
     return path
 
 
@@ -1068,7 +1113,11 @@ def _delete_file(conv, name):
     path = _file_path(conv, name)
     if not os.path.exists(path):
         raise ValueError('文件不存在')
+    size = os.path.getsize(path)
     os.remove(path)
+    used = _WS_USED.get(conv)          # 增量扣减（没缓存过就不用动，下次扫描为准）
+    if used is not None:
+        used[0] = max(0, used[0] - size)
 
 
 def _eval_expr(expr):
@@ -1231,10 +1280,7 @@ async def _complete(body: dict):
                 print(f'[serve] set_mtp 失败: {e}', file=sys.stderr)
         t0 = time.time()
         try:
-            if embeds:
-                st = await asyncio.to_thread(ENGINE.prefill_emb, ids, emb_path, spans)
-            else:
-                st = await asyncio.to_thread(ENGINE.prefill, ids)
+            st = await _engine_prefill(ids, embeds, emb_path, spans)
         finally:
             if emb_path:
                 try:
@@ -1251,7 +1297,16 @@ async def _complete(body: dict):
         STATS['prefill_ms'] += (t1 - t0) * 1000
 
         if not stream:
-            toks, end = await asyncio.to_thread(ENGINE.gen, n, temp, top_p, top_k, seed, stops)
+            try:
+                toks, end = await asyncio.to_thread(ENGINE.gen, n, temp, top_p, top_k,
+                                                    seed, stops)
+            except RuntimeError as e:
+                if '引擎' not in str(e):
+                    raise
+                # gen 中途引擎死掉：本次结果不可恢复（重启后无 logits），自愈重启
+                # 后让客户端重发请求 —— prefill 会自动全量重算，对话不丢。
+                await asyncio.to_thread(ENGINE.ensure)
+                raise HTTPException(503, '引擎刚重启，请重发本请求（上下文会自动重算）')
             out = toks
             t2 = time.time()
             STATS['gen_tokens'] += len(toks)
@@ -1287,7 +1342,17 @@ async def _complete(body: dict):
             async with LOCK:
                 tg0 = time.time()
                 ttft = None
-                st = ENGINE.gen_stream(n, temp, top_p, top_k, seed, stops)
+                try:
+                    st = ENGINE.gen_stream(n, temp, top_p, top_k, seed, stops)
+                except RuntimeError as e:
+                    if '引擎' not in str(e):
+                        raise
+                    # prefill 之后、GEN 之前引擎死了：自愈重启，本条流以提示收尾。
+                    await asyncio.to_thread(ENGINE.ensure)
+                    yield _sse(rid, created,
+                               {'content': '\n\n[引擎已重启，本次生成中断，请重发]'},
+                               model=req_model)
+                    return
                 try:
                     while True:
                         line = await asyncio.to_thread(st.get)
@@ -1350,9 +1415,17 @@ async def _complete(body: dict):
                     st.join(5.0)
                     raise
                 tg1 = time.time()
-                # 记下这条对话实际提交的 token 序列，下一轮可走「完全命中」
-                _conv_kv_commit(conv, msgs_in, ids, acc,
-                                split_thinking(T.decode(acc), think)[1])
+                # EOF（没有 END）且引擎死了 = 流中途崩溃：自愈重启，本条流以
+                # 已生成内容收尾；重启后 epoch 已变，绝不能把这条半截序列提交
+                # 成「已缓存前缀」。
+                if not ENGINE.alive():
+                    print(f'[serve] 引擎在流式生成中退出（已收到 {len(acc)} token），'
+                          '自动重启', file=sys.stderr)
+                    await asyncio.to_thread(ENGINE.ensure)
+                else:
+                    # 记下这条对话实际提交的 token 序列，下一轮可走「完全命中」
+                    _conv_kv_commit(conv, msgs_in, ids, acc,
+                                    split_thinking(T.decode(acc), think)[1])
             pms = (t1 - t0) * 1000
             gms = (tg1 - tg0) * 1000
             timings = {'prefill_tokens': fresh, 'prefill_ms': round(pms, 1),
@@ -1424,7 +1497,18 @@ async def _skill_events(body, tools):
             # 逐 token 读引擎输出：边生成边发，避免「等整段生成完才出现」
             toks = []
             split = ThinkSplitter(think)
-            st = ENGINE.gen_stream(n, temp, top_p, top_k, seed, stops)
+            try:
+                st = ENGINE.gen_stream(n, temp, top_p, top_k, seed, stops)
+            except RuntimeError as e:
+                if '引擎' not in str(e):
+                    raise
+                # 同普通流式路径：GEN 前引擎死了 → 自愈重启，本轮以提示收尾。
+                await asyncio.to_thread(ENGINE.ensure)
+                yield ('delta', '\n\n[引擎已重启，本次生成中断，请重发]')
+                yield ('done', {'text': '[引擎已重启，本次生成中断，请重发]',
+                                'reasoning': '', 'usage': {}, 'timings': {},
+                                'skills': events, 'streamed': True})
+                return
             try:
                 while True:
                     line = await asyncio.to_thread(st.get)
@@ -1442,6 +1526,13 @@ async def _skill_events(body, tools):
                 ENGINE.stop()          # 同普通路径：停引擎并等它收尾，再放锁
                 st.join(5.0)
                 raise
+            # 同普通流式路径：EOF 且引擎已死 = 中途崩溃 → 自愈重启；这半截序列
+            # 不能提交成「已缓存前缀」（见下方 engine_died 对 commit 的跳过）。
+            engine_died = not ENGINE.alive()
+            if engine_died:
+                print(f'[serve] 引擎在技能轮生成中退出（已收到 {len(toks)} token），'
+                      '自动重启', file=sys.stderr)
+                await asyncio.to_thread(ENGINE.ensure)
             t2 = time.time()
             full = T.decode(toks)
             if os.environ.get('RT_DEBUG_SKILL'):
@@ -1466,7 +1557,8 @@ async def _skill_events(body, tools):
                 streamed = True                 # 这一轮的文本已经流出去了
                 # 这一轮没有工具调用：把「已提交 token 序列」记下来，下一轮可走完全命中。
                 # 只有文本和客户端收到的完全一致时才记（有剥离就放弃，宁可整段重算）。
-                if final_text == answer:
+                # 引擎中途崩溃重启过（engine_died）就不记：这段序列没在新引擎里。
+                if final_text == answer and not engine_died:
                     _conv_kv_commit(conv, msgs_in, ids, toks, final_text)
                 break
             assistant = {'role': 'assistant', 'content': answer or full}

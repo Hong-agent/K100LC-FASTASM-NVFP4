@@ -1117,6 +1117,11 @@ button {
   display: none;
 }
 
+/* 桌面/移动文案互换（空状态里的引导语） */
+.only-mobile {
+  display: none;
+}
+
 /* ---------- 移动端 ---------- */
 
 @media (max-width: 860px) {
@@ -1151,36 +1156,44 @@ button {
     display: none;
   }
 
+  /* 顶栏收成一行：☰ + 模型输入（可伸缩）+ 文件/设置，省掉整行的按钮带 */
   .topbar {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 8px;
-    padding: 9px 10px;
+    padding: 8px 10px;
   }
 
   .cwd-wrap {
-    order: 1;
+    min-width: 0;
   }
 
   .topbar-actions {
-    order: 2;
-    width: 100%;
+    flex: none;
   }
 
   .topbar-actions .ghost-btn {
-    flex: 1;
-    padding: 9px 12px;
+    padding: 9px 11px;
   }
 
   .icon-btn {
-    padding: 9px 12px;
+    padding: 10px 12px;
+  }
+
+  .only-mobile {
+    display: inline;
+  }
+
+  .only-desktop {
+    display: none;
   }
 
   .messages {
-    padding: 14px 10px 6px;
+    padding: 12px 8px 6px;
   }
 
   .msg {
     margin-bottom: 12px;
+    gap: 8px;
   }
 
   .bubble {
@@ -1198,23 +1211,27 @@ button {
 
   .composer {
     gap: 8px;
-    padding: 8px 10px calc(10px + env(safe-area-inset-bottom, 0px));
+    padding: 8px 8px calc(10px + env(safe-area-inset-bottom, 0px));
     align-items: flex-end;
   }
 
+  .composer .ghost-btn {
+    padding: 10px 12px;
+  }
+
   .composer textarea {
-    min-height: 42px;
+    min-height: 44px;
     max-height: 132px;
     font-size: 16px;
-    padding: 10px 12px;
+    padding: 10px 11px;
   }
 
   .send-btn,
   .danger-btn {
-    padding: 11px 16px;
+    padding: 11px 14px;
     font-size: 15px;
     flex: none;
-    min-height: 42px;
+    min-height: 44px;
   }
 
   .cwd-input,
@@ -1274,10 +1291,27 @@ button {
   .thread-del {
     opacity: 1;
   }
+
+  .bubble {
+    padding: 8px 11px;
+  }
+
+  .empty {
+    margin-top: 4vh;
+  }
+
+  .empty h2 {
+    font-size: 18px;
+  }
 }
 
 @media (hover: none) {
   .thread-del {
+    opacity: 1;
+  }
+
+  /* 触屏没有 hover：代码块「复制」按钮常显 */
+  .codeblock .copy {
     opacity: 1;
   }
 }

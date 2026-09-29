@@ -494,6 +494,13 @@ struct VisionModel {
     float *d_cos = nullptr, *d_sin = nullptr, *d_merger = nullptr, *d_merger2 = nullptr;
     float *d_out = nullptr;
 
+    // pos/rope 表按 (gh,gw) 网格缓存：表内容只由网格决定（n=4*gh*gw 随之固定），
+    // 同网格的图片直接复用设备上已上传的表 —— 主机重建 + 三次 H2D 全部省掉。
+    // 上限 8 个网格，LRU 淘汰（淘汰只是删记录，设备缓冲会被新网格覆盖）。
+    std::map<std::pair<int, int>, long long> grid_cache;
+    long long grid_tick = 0;
+    static constexpr int GRID_CACHE_MAX = 8;
+
     static int align128(int n) { return (n + 127) / 128 * 128; }
 
     VW W(const std::string& name) {
@@ -643,23 +650,33 @@ struct VisionModel {
         for (int i = 0; i < nf; i++) inv[i] = 1.f / powf(10000.f, (2.f * i) / 36.f);
         cos.resize((size_t)n * HD);
         sin.resize((size_t)n * HD);
-        std::vector<float> ft((size_t)maxhw * nf);
+        // sincos 只依赖行号/列号（真正的自由度是 maxhw×nf，不是 n×nf）：
+        // 预计算一张表，逐 token 退化成纯 gather —— 超越函数调用从 n×72 降到
+        // maxhw×72（1024 patch 时约 30 倍），数值与逐 token 重算逐位一致。
+        std::vector<float> ct((size_t)maxhw * nf), st((size_t)maxhw * nf);
         for (int j = 0; j < maxhw; j++)
-            for (int i = 0; i < nf; i++) ft[(size_t)j * nf + i] = j * inv[i];
+            for (int i = 0; i < nf; i++) {
+                const float a = j * inv[i];
+                ct[(size_t)j * nf + i] = cosf(a);
+                st[(size_t)j * nf + i] = sinf(a);
+            }
+        const int gw2 = w / 2;
         for (int idx = 0; idx < n; idx++) {
             int rem = idx;
             const int mw = rem % 2; rem /= 2;
             const int mh = rem % 2; rem /= 2;
-            const int gc = rem % (w / 2); rem /= (w / 2);
+            const int gc = rem % gw2; rem /= gw2;
             const int gr = rem;
             const int row = gr * 2 + mh, col = gc * 2 + mw;
             float* c = cos.data() + (size_t)idx * HD;
             float* s = sin.data() + (size_t)idx * HD;
+            const float* crow = ct.data() + (size_t)row * nf;
+            const float* srow = st.data() + (size_t)row * nf;
+            const float* ccol = ct.data() + (size_t)col * nf;
+            const float* scol = st.data() + (size_t)col * nf;
             for (int i = 0; i < nf; i++) {
-                const float a = ft[(size_t)row * nf + i];
-                const float b = ft[(size_t)col * nf + i];
-                c[i] = cosf(a); s[i] = sinf(a);
-                c[nf + i] = cosf(b); s[nf + i] = sinf(b);
+                c[i] = crow[i]; s[i] = srow[i];
+                c[nf + i] = ccol[i]; s[nf + i] = scol[i];
                 c[2 * nf + i] = c[i]; s[2 * nf + i] = s[i];
                 c[3 * nf + i] = c[nf + i]; s[3 * nf + i] = s[nf + i];
             }
@@ -675,19 +692,43 @@ struct VisionModel {
             printf("vision: patch 数 %d > max_patches %d\n", n, max_patches); return false;
         }
         const int Mp = align128(n);
-        CK(hipMemset(d_patch, 0, (size_t)Mpad * PATCH_DIM * 4));
+        // 只清尾部 padding：[0,n) 马上被下面的 H2D 全量覆盖，[Mp,Mpad) 自构造期
+        // memset 后从未被写过、恒为零。原版全量清 Mpad 是纯浪费。
+        if (Mp > n)
+            CK(hipMemset(d_patch + (size_t)n * PATCH_DIM, 0,
+                         (size_t)(Mp - n) * PATCH_DIM * 4));
         CK(hipMemcpy(d_patch, patches, (size_t)n * PATCH_DIM * 4, hipMemcpyHostToDevice));
         linear(d_h, patch_w, d_patch, n);
         k_vit_bias_add(d_h, patch_b, n, H);
-        std::vector<float> pos;
-        make_pos(gh, gw, n, pos);
-        CK(hipMemcpy(d_pos, pos.data(), (size_t)n * H * 4, hipMemcpyHostToDevice));
+        // pos/rope 表按网格缓存（见 grid_cache 成员注释）。异常形状（n != 4*gh*gw，
+        // 理论上不该出现）不走缓存，每次照旧重算 —— 行为与旧版一致。
+        const bool cacheable = (n == 4 * gh * gw);
+        const auto key = std::make_pair(gh, gw);
+        auto it = grid_cache.find(key);
+        if (cacheable && it != grid_cache.end()) {
+            it->second = ++grid_tick;                 // 命中：设备上的表直接可用
+        } else {
+            std::vector<float> pos, cos, sin;
+            make_pos(gh, gw, n, pos);
+            make_rope(gh, gw, n, cos, sin);
+            CK(hipMemcpy(d_pos, pos.data(), (size_t)n * H * 4, hipMemcpyHostToDevice));
+            CK(hipMemcpy(d_cos, cos.data(), (size_t)n * HD * 4, hipMemcpyHostToDevice));
+            CK(hipMemcpy(d_sin, sin.data(), (size_t)n * HD * 4, hipMemcpyHostToDevice));
+            if (cacheable) {
+                if ((int)grid_cache.size() >= GRID_CACHE_MAX) {   // LRU 淘汰最旧网格
+                    auto old = std::min_element(
+                        grid_cache.begin(), grid_cache.end(),
+                        [](const std::pair<const std::pair<int, int>, long long>& a,
+                           const std::pair<const std::pair<int, int>, long long>& b) {
+                            return a.second < b.second;
+                        });
+                    grid_cache.erase(old);
+                }
+                grid_cache[key] = ++grid_tick;
+            }
+        }
         k_add_inplace(d_h, d_pos, (long long)n * H);
         dump_dev("h00", d_h, n, H);
-        std::vector<float> cos, sin;
-        make_rope(gh, gw, n, cos, sin);
-        CK(hipMemcpy(d_cos, cos.data(), (size_t)n * HD * 4, hipMemcpyHostToDevice));
-        CK(hipMemcpy(d_sin, sin.data(), (size_t)n * HD * 4, hipMemcpyHostToDevice));
         for (int il = 0; il < DEPTH; il++) {
             VLayer& L = layers[il];
             k_vit_layernorm(d_norm, d_h, L.n1w, L.n1b, n, H, 1e-6f);
@@ -883,6 +924,205 @@ void Dev::alloc(int T) {
 // ============================== 模型 =======================================
 // 视觉塔输出的图像 embedding：覆盖 d.x 中 [start, start+count) 行的词嵌入。
 // data 是宿主 f32 [count][hidden]；start 是整段 prompt 内的 token 下标。
+
+// [kv_pool] begin —— 全局多会话 KV 槽池（纯宿主逻辑；设备拷贝在 Model::kv_* 里）。
+// 被 tests/test_kv_pool.py 整段抽取出去配 stub 编译离线单测，改动时保持自包含：
+// 只依赖 std::，不引用 Model / cfg / KVEL（维度全走 KvDims）。
+//
+// 动机：引擎只有一份按绝对位置写的注意力 KV + 一份 GDN 循环态，切换对话（A→B）
+// 时 B 的预填充直接把 A 的状态覆盖掉。槽池把「切走的那一刻」的完整状态泊进槽：
+//   * 48 个线性层的 ssm/conv 循环态 + h_prev（活态，以及预填充结束点的回退快照）
+//   * 16 个注意力层 + MTP 层的 KV 前缀（k/ksc/v/vsc，按 [0, len) 拷出）
+// A 再回来时整段恢复，只补新消息 —— A→B→A 不再整段重算。
+// 匹配语义与单上下文复用完全一致：新序列以槽序列为前缀 → 接着算（append）；
+// 只命中到槽的快照点 → 退回快照点再补（rewind）；否则不入眼。
+struct KvDims {
+    int n_kv = 0, head_dim = 0;            // 注意力 KV 头数 / 每头维度
+    int kvel = 4, bg = 64;                 // 每 dword 元素数（KV_BITS=8 → 4）；v 尺度 tile 高
+    int max_ctx = 0, hidden = 0;
+    int n_lin = 0, n_attn = 0;             // 线性层 / 注意力层个数
+    long long ssm_one = 0, conv_one = 0;   // 每线性层循环态 / 卷积态的 float 数
+};
+
+// 一段备份拷贝的几何：live 侧 pitch 与槽侧 pitch 不同（live 按 max_ctx 步长分配，
+// 槽内紧排）。连续段就是 height=1 的特例，统一走 2D 拷贝。
+struct KvSeg {
+    int src;                // 0=ssm(lin) 1=conv(lin) 2=hprev 3=snap_ssm 4=snap_conv 5=snap_hprev
+                            // 6=kc(attn) 7=ksc 8=vc 9=vsc 10=mtp_kc 11=mtp_ksc 12=mtp_vc 13=mtp_vsc
+    int idx;                // 层号（按 src 的类别：线性槽号 / 注意力槽号）
+    size_t off;             // 槽内字节偏移
+    size_t pitch_live;      // live 缓冲每行步长（字节）
+    size_t pitch_slot;      // 槽内每行步长（字节）
+    size_t width, height;   // 2D 拷贝的宽（字节）与行数
+};
+
+struct KvSlot {
+    std::vector<int> ids;               // 泊船时的完整上下文（prompt + 已生成）
+    int seq_len = 0, mtp_len = 0;       // 泊船时的一致长度
+    int snap_len = -1;                  // 预填充结束点（rewind 用）
+    bool snap_valid = false;
+    void* dev = nullptr;                // 备份缓冲（Model 分配/释放）
+    size_t bytes = 0;                   // 备缓冲字节数（0=空槽）
+    long long tick = 0;                 // LRU 时钟
+    bool used = false;
+};
+
+struct KvPool {
+    int cap = 0;                        // 槽数（0=禁用；RT_KV_POOL）
+    size_t cap_bytes = 0;               // 全部槽备份总字节上限（RT_KV_POOL_MB）
+    std::vector<KvSlot> slots;
+    int active = -1;                    // 活跃上下文来自哪个槽（-1=未入池）
+    long long tick = 0;
+    size_t total_bytes = 0;
+    long long n_save = 0, n_restore = 0, n_evict = 0;
+    std::function<void(void*)> free_dev;    // 驱逐/清空时释放设备缓冲（离线测试注入 stub）
+
+    void config(int cap_, size_t cap_bytes_) {
+        cap = cap_ > 0 ? cap_ : 0;
+        cap_bytes = cap_bytes_;
+        slots.assign(cap, KvSlot{});
+    }
+
+    // 槽备份布局：返回总字节，并把每段拷贝几何写进 segs（顺序固定，Model 按序拷）。
+    static size_t layout(const KvDims& d, int seq, int mtp, bool snap, bool mtp_on,
+                         std::vector<KvSeg>* segs) {
+        size_t off = 0;
+        auto push = [&](int src, int idx, size_t pitch_live, size_t row, size_t h) {
+            if (segs) segs->push_back(KvSeg{src, idx, off, pitch_live, row, row, h});
+            off += row * h;
+        };
+        for (int i = 0; i < d.n_lin; i++)
+            push(0, i, (size_t)d.ssm_one * 4, (size_t)d.ssm_one * 4, 1);
+        for (int i = 0; i < d.n_lin; i++)
+            push(1, i, (size_t)d.conv_one * 4, (size_t)d.conv_one * 4, 1);
+        push(2, 0, (size_t)d.hidden * 4, (size_t)d.hidden * 4, 1);
+        if (snap) {
+            for (int i = 0; i < d.n_lin; i++)
+                push(3, i, (size_t)d.ssm_one * 4, (size_t)d.ssm_one * 4, 1);
+            for (int i = 0; i < d.n_lin; i++)
+                push(4, i, (size_t)d.conv_one * 4, (size_t)d.conv_one * 4, 1);
+            push(5, 0, (size_t)d.hidden * 4, (size_t)d.hidden * 4, 1);
+        }
+        const size_t KV = (size_t)d.n_kv, D = (size_t)d.head_dim;
+        const size_t kvel = (size_t)d.kvel, bg = (size_t)d.bg, MC = (size_t)d.max_ctx;
+        const size_t krow = (size_t)seq * (D / kvel) * 4;      // k 每 head 的前缀字节
+        const size_t vrows = ((size_t)seq + kvel - 1) / kvel;  // v 覆盖前缀的行数
+        const size_t vtiles = ((size_t)seq + bg - 1) / bg;     // v 尺度覆盖前缀的 tile 数
+        for (int i = 0; i < d.n_attn; i++) {
+            push(6, i, MC * (D / kvel) * 4, krow, KV);         // kcache   [H][kv][D/kvel]
+            push(7, i, 2 * MC * 4, 2 * (size_t)seq * 4, KV);   // ksc      [H][2][kv]
+            push(8, i, (MC / kvel) * D * 4, vrows * D * 4, KV);// vcache   [H][kv/kvel][D]
+            push(9, i, (MC / bg) * D * 4, vtiles * D * 4, KV);// vsc      [H][tile][D]
+        }
+        if (mtp_on) {
+            const size_t mrow = (size_t)mtp * (D / kvel) * 4;
+            const size_t mvrows = ((size_t)mtp + kvel - 1) / kvel;
+            const size_t mvtiles = ((size_t)mtp + bg - 1) / bg;
+            push(10, 0, MC * (D / kvel) * 4, mrow, KV);
+            push(11, 0, 2 * MC * 4, 2 * (size_t)mtp * 4, KV);
+            push(12, 0, (MC / kvel) * D * 4, mvrows * D * 4, KV);
+            push(13, 0, (MC / bg) * D * 4, mvtiles * D * 4, KV);
+        }
+        return off;
+    }
+
+    // 最佳候选槽（不含活跃槽——活跃上下文在外面直接比）：返回 {槽号, 可复用起点}。
+    // 起点语义：完全延续 → 槽全长；否则若命中到快照点 → 快照点；都不行 → 0。
+    std::pair<int, size_t> best_match(const std::vector<int>& ids) const {
+        int bi = -1;
+        size_t bs = 0;
+        for (int i = 0; i < (int)slots.size(); i++) {
+            const KvSlot& s = slots[i];
+            if (!s.used || s.bytes == 0 || i == active) continue;
+            if ((int)s.ids.size() != s.seq_len) continue;              // 一致性守卫
+            const size_t lim = std::min(s.ids.size(), ids.size());
+            size_t lcp = 0;
+            while (lcp < lim && s.ids[lcp] == ids[lcp]) lcp++;
+            size_t st = 0;
+            if (lcp == s.ids.size() && lcp < ids.size())
+                st = lcp;                                             // append：整段延续
+            else if (s.snap_valid && s.snap_len >= 0 &&
+                     (size_t)s.snap_len <= s.ids.size() &&
+                     lcp >= (size_t)s.snap_len && (size_t)s.snap_len < ids.size())
+                st = (size_t)s.snap_len;                              // rewind：退回快照点
+            if (st > bs) { bs = st; bi = i; }
+        }
+        return {bi, bs};
+    }
+
+    // 为「泊当前对话」找宿主槽：老槽原地更新；否则空槽优先、LRU 驱赶。
+    // keep：马上要恢复的槽号，绝不能被拿来当宿主或驱逐（-1=无）。
+    // 放不下（need 超总预算，或驱干净了还超）→ -1 = 放弃入池（直接丢弃，与旧行为一致）。
+    int acquire_home(size_t need, int keep = -1) {
+        if (cap <= 0 || need == 0 || need > cap_bytes) return -1;
+        int home = active;
+        if (home < 0) {
+            home = -1;
+            for (int i = 0; i < cap; i++)
+                if (!slots[i].used && i != keep) { home = i; break; }
+            if (home < 0) {                                           // 没空槽 → 驱逐最旧
+                home = lru_victim(keep, -1);
+                if (home < 0) return -1;
+                evict(home);
+            }
+        }
+        while (total_bytes - slots[home].bytes + need > cap_bytes) {
+            const int v = lru_victim(home, keep);                     // 驱别的槽腾预算
+            if (v < 0) return -1;
+            evict(v);
+        }
+        return home;
+    }
+
+    void commit_save(int home, const std::vector<int>& ids_, int seq, int mtp,
+                     int snap_len_, bool snap_valid_, void* dev, size_t bytes) {
+        total_bytes -= slots[home].bytes;
+        KvSlot& s = slots[home];
+        s.ids = ids_;
+        s.seq_len = seq; s.mtp_len = mtp;
+        s.snap_len = snap_len_; s.snap_valid = snap_valid_;
+        s.dev = dev; s.bytes = bytes; s.used = true;
+        s.tick = ++tick;
+        total_bytes += bytes;
+        active = home;
+        n_save++;
+    }
+
+    void commit_restore(int idx) {
+        slots[idx].tick = ++tick;
+        active = idx;
+        n_restore++;
+    }
+
+    void drop_active() { active = -1; }     // 活跃上下文已被重算/清空：不再对应任何槽
+
+    void clear_all() {                      // RESET：全池作废（设备缓冲经 free_dev 释放）
+        for (auto& s : slots) {
+            if (s.used && s.dev && free_dev) free_dev(s.dev);
+            s = KvSlot{};
+        }
+        total_bytes = 0;
+        active = -1;
+    }
+
+private:
+    int lru_victim(int ex1, int ex2) const {  // 最旧的已用槽（排除 ex1/ex2；-1=不排除）
+        int v = -1;
+        for (int i = 0; i < (int)slots.size(); i++) {
+            if (!slots[i].used || i == ex1 || i == ex2) continue;
+            if (v < 0 || slots[i].tick < slots[v].tick) v = i;
+        }
+        return v;
+    }
+    void evict(int i) {
+        if (slots[i].used && slots[i].dev && free_dev) free_dev(slots[i].dev);
+        total_bytes -= slots[i].bytes;
+        slots[i] = KvSlot{};
+        n_evict++;
+    }
+};
+// [kv_pool] end
+
 struct EmbSpan {
     const float* data;
     int start;
@@ -937,6 +1177,19 @@ struct Model {
     bool ctx_snap_valid = false;
     void save_ctx_snapshot();
     bool restore_ctx_snapshot();
+
+    // ---- 全局 KV 槽池（见文件头 [kv_pool]：A→B→A 切对话不丢 KV）----
+    KvPool kv_pool;
+    KvDims kv_dims;
+    bool kv_trace = false;
+    size_t kv_slot_bytes(int seq, int mtp, bool snap) const;
+    void kv_save_active(int keep = -1);
+    bool kv_restore_slot(int idx);
+    void kv_pool_clear();
+    void kv_copy_slot(void* slot_dev, const std::vector<KvSeg>& segs, bool to_slot);
+    const void* kv_live_ptr(const KvSeg& g);
+    int lin_slot_inv(int slot) const;             // 线性槽号 → 层号（反查 lin_slot）
+    int attn_slot_inv(int slot) const;            // 注意力槽号 → 层号（反查 attn_slot）
 
     // 视觉塔（独立 RT4 文件；不参与文本层）
     VisionModel vm;
@@ -1166,7 +1419,7 @@ void Model::init(const std::string& path, const std::string& json) {
         rp4_last_group = maxg;
         pf.add_file(rp4.path.c_str(), true);
         pf.set_linear(rp4.data_off, rp4.dev, rp4.data_len, ends);
-        printf("RP4: %s  %.3f GB  %zu 张量（main %d / NVFP4 %d / MTP+视觉 %d），单文件模式\n",
+        printf("RP4: %s  %.3f GB  %zu 张量（main %zu / NVFP4 %d / MTP+视觉 %d），单文件模式\n",
                rp4.path.c_str(), rp4.data_len / 1e9, rp4.rows.size(),
                rt.tensors.size(), (int)nv_rows.size(),
                (int)std::count_if(rp4.rows.begin(), rp4.rows.end(),
@@ -1410,6 +1663,21 @@ void Model::init(const std::string& path, const std::string& json) {
             printf("MTP 未启用（权重加载失败）\n");
         }
     }
+    // ---- 全局 KV 槽池（A→B→A 切对话不丢 KV；RT_KV_POOL=0 关闭）----
+    // 放在 load_mtp 之后：槽大小估算要把 MTP 的 KV 段算进去。
+    {
+        const int pc = getenv("RT_KV_POOL") ? atoi(getenv("RT_KV_POOL")) : 4;
+        const long long pmb = getenv("RT_KV_POOL_MB") ? atoll(getenv("RT_KV_POOL_MB")) : 4096;
+        kv_dims = KvDims{cfg.n_kv, cfg.head_dim, KVEL, BG, max_ctx, cfg.hidden,
+                         n_lin, n_attn, (long long)ssm_one, (long long)conv_one};
+        kv_pool.config(pc, pmb > 0 ? (size_t)pmb * 1024 * 1024 : 0);
+        kv_pool.free_dev = [](void* p) { if (p) hipFree(p); };
+        kv_trace = getenv("RT_KV_TRACE") && atoi(getenv("RT_KV_TRACE")) != 0;
+        const size_t one8k = KvPool::layout(kv_dims, 8192, 8191, true, mtp_on, nullptr);
+        printf("KV 池：%d 槽 / %.1f GB 上限（约 %.0f MB/8k 会话）%s\n",
+               kv_pool.cap, kv_pool.cap_bytes / 1073741824.0, one8k / 1048576.0,
+               kv_pool.cap > 0 ? "" : "【已关闭】");
+    }
     // ---- 所有预取项都登记完了，启动后台加载 ----
     // 这里立即返回：服务可以马上开始接受请求，第一次前向会按层等数据到位。
     pf.start();
@@ -1530,6 +1798,7 @@ void Model::reset_state() {
     ctx_ids.clear();
     ctx_snap_len = -1;
     ctx_snap_valid = false;
+    kv_pool.drop_active();          // 活跃上下文清零：不再对应任何槽（槽内容保留待回港）
     for (int il = 0; il < cfg.n_layer; il++) {
         if (cfg.is_full(il)) {
             // KV 的尺度数组要初始化（未写的 tile 不能是 NaN）
@@ -2102,6 +2371,113 @@ bool Model::restore_ctx_snapshot() {
     return true;
 }
 
+// ================================ 全局 KV 槽池 ================================
+// 设备侧的保存/恢复；决策与布局纯逻辑在文件头 [kv_pool] 的 KvPool 里。
+// 一次泊船/回港 = 一次 D2D 拷贝（几百 MB，毫秒级），对比整段重算是秒到分钟级。
+
+size_t Model::kv_slot_bytes(int seq, int mtp, bool snap) const {
+    return KvPool::layout(kv_dims, seq, mtp, snap, mtp_on, nullptr);
+}
+
+// 槽段 → live 缓冲指针（顺序与 KvPool::layout 的 src 编号一一对应）
+const void* Model::kv_live_ptr(const KvSeg& g) {
+    switch (g.src) {
+        case 0:  return ssm_state[lin_slot_inv(g.idx)];       // 线性槽号 → 层号
+        case 1:  return conv_state[lin_slot_inv(g.idx)];
+        case 2:  return d.h_prev;
+        case 3:  return ctx_ssm + (size_t)g.idx * kv_dims.ssm_one;
+        case 4:  return ctx_conv + (size_t)g.idx * kv_dims.conv_one;
+        case 5:  return ctx_hprev;
+        case 6:  return kcache[attn_slot_inv(g.idx)];
+        case 7:  return ksc[attn_slot_inv(g.idx)];
+        case 8:  return vcache[attn_slot_inv(g.idx)];
+        case 9:  return vsc[attn_slot_inv(g.idx)];
+        case 10: return mtp_kc;
+        case 11: return mtp_ksc;
+        case 12: return mtp_vc;
+        default: return mtp_vsc;
+    }
+}
+
+// lin_slot / attn_slot 是「层号 → 槽号」；这里要反查。层号 ≤ 64，直接线性扫。
+int Model::lin_slot_inv(int slot) const {
+    for (int il = 0; il < (int)lin_slot.size(); il++)
+        if (lin_slot[il] == slot) return il;
+    return -1;
+}
+int Model::attn_slot_inv(int slot) const {
+    for (int il = 0; il < (int)attn_slot.size(); il++)
+        if (attn_slot[il] == slot) return il;
+    return -1;
+}
+
+void Model::kv_copy_slot(void* slot_dev, const std::vector<KvSeg>& segs, bool to_slot) {
+    char* base = (char*)slot_dev;
+    for (const KvSeg& g : segs) {
+        if (g.width == 0 || g.height == 0) continue;
+        void* live = const_cast<void*>(kv_live_ptr(g));
+        if (to_slot)
+            CK(hipMemcpy2DAsync(base + g.off, g.pitch_slot, live, g.pitch_live,
+                                g.width, g.height, hipMemcpyDeviceToDevice, 0));
+        else
+            CK(hipMemcpy2DAsync(live, g.pitch_live, base + g.off, g.pitch_slot,
+                                g.width, g.height, hipMemcpyDeviceToDevice, 0));
+    }
+}
+
+// 把当前活跃对话泊进池（切走 / 被整段重算替换之前调用）。
+// keep：紧接着要恢复的槽号，泊船时绝不能驱逐它（-1=无）。
+// 不变式守卫：ctx_ids 与 seq_len 失步（被调试 op 动过）就不泊，宁可丢。
+void Model::kv_save_active(int keep) {
+    if (kv_pool.cap <= 0 || ctx_ids.empty() || (int)ctx_ids.size() != seq_len) return;
+    const bool snap = ctx_snap_valid && ctx_snap_len >= 0 &&
+                      (size_t)ctx_snap_len <= ctx_ids.size();
+    const size_t need = kv_slot_bytes(seq_len, mtp_len, snap);
+    const int home = kv_pool.acquire_home(need, keep);
+    if (home < 0) return;
+    // 备份缓冲按需重建（对话切换是人一次次的时间尺度，精确分配省显存）
+    KvSlot& s = kv_pool.slots[home];
+    if (s.dev) { CK(hipFree(s.dev)); s.dev = nullptr; kv_pool.total_bytes -= s.bytes; s.bytes = 0; }
+    CK(hipMalloc(&s.dev, need));
+    std::vector<KvSeg> segs;
+    KvPool::layout(kv_dims, seq_len, mtp_len, snap, mtp_on, &segs);
+    kv_copy_slot(s.dev, segs, true);
+    kv_pool.commit_save(home, ctx_ids, seq_len, mtp_len,
+                        snap ? ctx_snap_len : -1, snap, s.dev, need);
+    if (kv_trace)
+        fprintf(stderr, "[kvp] 泊船：槽 %d，%d tok（快照 %d）%.0f MB，池 %.2f/%.0f GB\n",
+                home, seq_len, snap ? ctx_snap_len : -1, need / 1048576.0,
+                kv_pool.total_bytes / 1073741824.0, kv_pool.cap_bytes / 1073741824.0);
+}
+
+// 回港：把槽内容整段恢复成活跃上下文（调用方保证这个槽确实比当前上下文更优）。
+bool Model::kv_restore_slot(int idx) {
+    if (idx < 0 || idx >= (int)kv_pool.slots.size()) return false;
+    KvSlot& s = kv_pool.slots[idx];
+    if (!s.used || !s.dev || s.bytes == 0 || (int)s.ids.size() != s.seq_len) return false;
+    const bool snap = s.snap_valid && s.snap_len >= 0 && (size_t)s.snap_len <= s.ids.size();
+    std::vector<KvSeg> segs;
+    if (KvPool::layout(kv_dims, s.seq_len, s.mtp_len, snap, mtp_on, &segs) != s.bytes)
+        return false;                       // 布局对不上（维度变过？）宁可不恢复
+    kv_copy_slot(s.dev, segs, false);
+    seq_len = s.seq_len;
+    mtp_len = s.mtp_len;
+    ctx_ids = s.ids;
+    ctx_snap_len = snap ? s.snap_len : -1;
+    ctx_snap_valid = snap;
+    kv_pool.commit_restore(idx);
+    if (kv_trace)
+        fprintf(stderr, "[kvp] 回港：槽 %d，%d tok（快照 %d）\n", idx, seq_len,
+                snap ? ctx_snap_len : -1);
+    return true;
+}
+
+void Model::kv_pool_clear() {               // RESET：全池作废（基准测量要「冷」状态）
+    kv_pool.clear_all();
+    if (kv_trace) fprintf(stderr, "[kvp] 清池\n");
+}
+
+
 void Model::rollback_state(int keep) {
     const int H = cfg.hidden;
     if (keep <= 0) return;
@@ -2352,6 +2728,9 @@ static void engine_loop(Model& m) {
     //   2) 只命中到「上次预填充结束」的快照点      → 退回快照点再补
     //      （模型会先输出 <think> 再给正文，而客户端只回传正文，所以通常落在这一档）
     //   3) 都不命中（换了对话 / 改了历史 / 带图）  → 老老实实整段重算
+    //   1')/2') 的候选不止当前上下文：全局 KV 槽池里泊着的别的对话也算（A→B→A 时
+    //   A 的 KV 在槽里，恢复它比整段重算便宜得多）。槽赢了就先把当前对话泊进池、
+    //   再把槽恢复成活跃上下文，然后照常走 1)/2)。
     auto run_prefill = [&](const std::vector<int>& ids, const EmbSpan* spans, int nspans) {
         size_t start = 0;
         size_t lcp = 0;
@@ -2361,26 +2740,52 @@ static void engine_loop(Model& m) {
             m.ctx_ids.clear();
             m.ctx_snap_valid = false;
             m.ctx_snap_len = -1;
+            m.kv_pool.drop_active();          // 失步的活跃上下文不可信，也不再入池
         }
         // 只有纯文本才复用：带视觉 embedding 的 prompt 不能靠 token 前缀判断。
         // RT_NO_KV_REUSE=1 可关掉复用（A/B 对拍、排查问题时用）。
         static const bool no_reuse = getenv("RT_NO_KV_REUSE") && atoi(getenv("RT_NO_KV_REUSE")) != 0;
-        if (!no_reuse && nspans == 0 &&
-            (int)m.ctx_ids.size() == m.seq_len && !m.ctx_ids.empty()) {
-            const size_t lim = std::min(m.ctx_ids.size(), ids.size());
-            while (lcp < lim && m.ctx_ids[lcp] == ids[lcp]) lcp++;
-            if (lcp == m.ctx_ids.size() && lcp < ids.size()) {
-                start = lcp; mode = "append";
-            } else if (m.ctx_snap_valid && lcp >= (size_t)m.ctx_snap_len &&
-                       (size_t)m.ctx_snap_len < ids.size() && m.restore_ctx_snapshot()) {
-                start = (size_t)m.ctx_snap_len; mode = "rewind";
+        if (!no_reuse && nspans == 0) {
+            // ---- 先问全局槽池：别的对话也许比当前上下文更值得用（A→B→A）----
+            if (m.kv_pool.cap > 0) {
+                size_t active_start = 0;
+                if (!m.ctx_ids.empty() && (int)m.ctx_ids.size() == m.seq_len) {
+                    const size_t alim = std::min(m.ctx_ids.size(), ids.size());
+                    size_t alcp = 0;
+                    while (alcp < alim && m.ctx_ids[alcp] == ids[alcp]) alcp++;
+                    if (alcp == m.ctx_ids.size() && alcp < ids.size())
+                        active_start = alcp;
+                    else if (m.ctx_snap_valid && alcp >= (size_t)m.ctx_snap_len &&
+                             (size_t)m.ctx_snap_len < ids.size())
+                        active_start = (size_t)m.ctx_snap_len;
+                }
+                const auto [si, sstart] = m.kv_pool.best_match(ids);
+                if (si >= 0 && sstart > active_start) {
+                    m.kv_save_active(si);     // 先把当前对话泊进它的槽（keep=si 防误驱）
+                    m.kv_restore_slot(si);    // 槽回港成为活跃上下文；失败则维持原状走下面的老路
+                }
+            }
+            // ---- 当前上下文（可能刚被槽恢复替换）照常 append / rewind ----
+            if ((int)m.ctx_ids.size() == m.seq_len && !m.ctx_ids.empty()) {
+                const size_t lim = std::min(m.ctx_ids.size(), ids.size());
+                while (lcp < lim && m.ctx_ids[lcp] == ids[lcp]) lcp++;
+                if (lcp == m.ctx_ids.size() && lcp < ids.size()) {
+                    start = lcp; mode = "append";
+                } else if (m.ctx_snap_valid && lcp >= (size_t)m.ctx_snap_len &&
+                           (size_t)m.ctx_snap_len < ids.size() && m.restore_ctx_snapshot()) {
+                    start = (size_t)m.ctx_snap_len; mode = "rewind";
+                }
             }
         }
         if (getenv("RT_KV_TRACE"))
-            fprintf(stderr, "[kv] seq_len=%d ctx=%zu snap=%d(%s) lcp=%zu start=%zu mode=%s\n",
+            fprintf(stderr, "[kv] seq_len=%d ctx=%zu snap=%d(%s) lcp=%zu start=%zu mode=%s"
+                    " 池[泊%lld 港%lld 逐%lld]\n",
                     m.seq_len, m.ctx_ids.size(), m.ctx_snap_len,
-                    m.ctx_snap_valid ? "valid" : "invalid", lcp, start, mode);
+                    m.ctx_snap_valid ? "valid" : "invalid", lcp, start, mode,
+                    m.kv_pool.n_save, m.kv_pool.n_restore, m.kv_pool.n_evict);
         if (start == 0) {
+            // 换对话 / 改历史 / 带图：当前对话先泊进池（全局生效），再整段重算新的。
+            if (!no_reuse && m.kv_pool.cap > 0) m.kv_save_active();
             m.reset_state();
             mode = "none";
         }
@@ -2564,22 +2969,52 @@ static void engine_loop(Model& m) {
             long long draft_try = 0, draft_ok = 0, mtp_rounds = 0;
             bool interrupted = false;              // 客户端发来 STOP
             std::vector<float> tlog;
+            float mtp_ema = -1.f;                  // MTP 自适应的接受率 ema（统计输出用）
             m.prof_reset();
             auto t0 = std::chrono::steady_clock::now();
             const size_t V = 248320;
             if (m.mtp_on && smp.temp <= 0.f && m.mtp_n > 0) {
                 // 贪心 MTP 投机：每轮草拟 K 个、主模型一次前向校验，接受前缀。
+                // RT_MTP_HOST_ARGMAX=1 退回旧的主机侧 argmax 路径（A/B 对照用）。
+                static const bool host_argmax =
+                    getenv("RT_MTP_HOST_ARGMAX") && atoi(getenv("RT_MTP_HOST_ARGMAX")) != 0;
+                // 自适应草稿数（RT_MTP_ADAPTIVE=0 关闭，默认开）：ema 跟踪接受率，
+                // 接受率低的内容（代码、列表边界）降 K 省掉无效草稿 —— 草稿链成本
+                // 近似线性于 K，全拒时这 K 步全部白跑。升档要连续 2 轮达标（滞回）
+                // 防抖动；前 5 轮满 K 收集统计。
+                static const bool adapt =
+                    !(getenv("RT_MTP_ADAPTIVE") && atoi(getenv("RT_MTP_ADAPTIVE")) == 0);
+                float acc_ema = 0.6f;              // 乐观先探
+                int last_K = 3, up_cnt = 0;
+                bool have_next = false;            // 设备侧路径：下轮首 token 已由 argmax 直出
+                int next_tok = 0;
                 while (produced < n) {
                     if (stop_pending()) { interrupted = true; break; }
                     int id;
-                    { ProfTick _t(m.pa(P_SAMPLE)); id = smp.pick(lg.data(), V); }
+                    { ProfTick _t(m.pa(P_SAMPLE));
+                      // 设备侧路径下，贪心 token 直接用上一轮验证批的 argmax，
+                      // 不必再扫一遍 lg（贪心 pick 本身就是 argmax，逐位等价）。
+                      if (have_next) { id = next_tok; have_next = false; }
+                      else             id = smp.pick(lg.data(), V); }
                     printf("TOK %d\n", id);
                     fflush(stdout);
                     produced++;
                     if (std::find(stops.begin(), stops.end(), id) != stops.end()) break;
                     if (produced >= n) break;
 
-                    const int K = std::min(std::min(m.mtp_n, n - produced), 3);
+                    int K = std::min(std::min(m.mtp_n, n - produced), 3);
+                    if (adapt && mtp_rounds > 5) {
+                        int want = (int)std::lrint(acc_ema * m.mtp_n * 1.25f);
+                        want = std::max(1, std::min(want, m.mtp_n));
+                        if (want > last_K) {       // 升档滞回：连续两轮想升才真的升
+                            if (++up_cnt < 2) want = last_K;
+                            else up_cnt = 0;
+                        } else {
+                            up_cnt = 0;
+                        }
+                        K = std::min(K, want);
+                    }
+                    last_K = K;
                     mtp_rounds++;
                     int drafts[8];
                     // 草稿链留在设备上（中间不回主机）；快照槽位 0..K-1 供回滚用
@@ -2595,23 +3030,38 @@ static void engine_loop(Model& m) {
                         m.forward(cand, K + 1, false, K + 1, false, true);
                         CK(hipDeviceSynchronize());
                     }
-                    // 校验批的 argmax 在主机做：拷回 (K+1)×1MB logits 再扫一遍全词表（0.82ms/轮）。
-                    // 试过搬去设备侧（单 block k_argmax × (K+1)），反而 2.30ms/轮——单 block
-                    // 读 1MB 是延迟受限的，要赢得多 block 两级归约，留给以后连同小 batch
-                    // 注意力一起做（见 docs/MTP.md §7）。
-                    tlog.resize((size_t)(K + 1) * V);
-                    { ProfTick _t(m.pa(P_COPY));
-                      CK(hipMemcpy(tlog.data(), m.d.logits_all, tlog.size() * 4,
-                                   hipMemcpyDeviceToHost)); }
-
+                    // 校验批的 argmax：默认走设备侧两级归约（k_new.hip 的 k_argmax：
+                    // 128 block 扫段 + 1 block 合并），每轮只回读 (K+1) 个 int。
+                    // 旧路径拷回 (K+1)×1MB logits 再在主机扫全词表，合计 0.82ms/轮；
+                    // 更早试过的「单 block 设备版」反而 2.30ms/轮——单 block 串行读
+                    // 1MB 是延迟受限的，两级归约版没有这个问题。
+                    int am[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     int acc = 0;
-                    for (int i = 0; i < K; i++) {
-                        const float* row = tlog.data() + (size_t)i * V;
-                        int bi = 0; float bv = row[0];
-                        for (int v = 1; v < (int)V; v++)
-                            if (row[v] > bv) { bv = row[v]; bi = v; }
-                        if (bi == drafts[i]) acc++; else break;
+                    if (host_argmax) {
+                        tlog.resize((size_t)(K + 1) * V);
+                        { ProfTick _t(m.pa(P_COPY));
+                          CK(hipMemcpy(tlog.data(), m.d.logits_all, tlog.size() * 4,
+                                       hipMemcpyDeviceToHost)); }
+                        for (int i = 0; i < K; i++) {
+                            const float* row = tlog.data() + (size_t)i * V;
+                            int bi = 0; float bv = row[0];
+                            for (int v = 1; v < (int)V; v++)
+                                if (row[v] > bv) { bv = row[v]; bi = v; }
+                            if (bi == drafts[i]) acc++; else break;
+                        }
+                    } else {
+                        { ProfTick _t(m.pa(P_COPY));
+                          for (int i = 0; i <= K; i++)      // 行 K 是全接受时的 bonus
+                              k_argmax(m.d.logits_all + (size_t)i * V, (long long)V,
+                                       m.d.argmax + i);
+                          CK(hipMemcpy(am, m.d.argmax, (size_t)(K + 1) * sizeof(int),
+                                       hipMemcpyDeviceToHost)); }
+                        for (int i = 0; i < K; i++) {
+                            if (am[i] == drafts[i]) acc++; else break;
+                        }
                     }
+                    if (K > 0) acc_ema = 0.85f * acc_ema + 0.15f * ((float)acc / K);
+                    mtp_ema = acc_ema;
                     // 调试开关：强制全部拒绝，用来单独验证回滚路径与普通解码等价
                     if (getenv("RT_MTP_FORCE_REJECT")) acc = 0;
                     if (getenv("RT_MTP_TRACE")) {
@@ -2656,9 +3106,14 @@ static void engine_loop(Model& m) {
                     }
 
                     if (hit_stop || produced >= n) break;
-                    {
+                    if (host_argmax) {
                         ProfTick _t(m.pa(P_COPY));
                         memcpy(lg.data(), tlog.data() + (size_t)a_use * V, V * 4);
+                    } else {
+                        // 接受前缀之后那一行的 argmax 就是下一轮首 token（贪心下与
+                        // smp.pick(lg) 逐位等价）：1MB 行拷贝 + 主机全词表扫描全省掉。
+                        next_tok = am[a_use];
+                        have_next = true;
                     }
                 }
             } else {
@@ -2683,11 +3138,15 @@ static void engine_loop(Model& m) {
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             printf("END %d %.1f%s\n", produced, ms, interrupted ? " stopped" : "");
             fflush(stdout);
-            if (draft_try > 0)
+            if (draft_try > 0) {
                 fprintf(stderr, "MTP 统计：轮数 %lld，草稿 %lld，接受 %lld（%.3f token/轮，%.1f%%）\n",
                         mtp_rounds, draft_try, draft_ok, (double)draft_ok /
                         std::max(1.0, (double)mtp_rounds),
                         100.0 * (double)draft_ok / (double)draft_try);
+                if (mtp_ema >= 0.f)
+                    fprintf(stderr, "MTP 自适应：接受率 ema=%.2f（RT_MTP_ADAPTIVE=0 可关）\n",
+                            mtp_ema);
+            }
             m.prof_print("decode");
         } else if (op == "MTPBENCH") {
             // 这些是调试 op，会自己乱动 seq_len / 快照，跑完不再保证和 ctx_ids 一致：

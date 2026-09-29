@@ -36,6 +36,13 @@ run test_scale_mul        bash tests/test_scale_mul.sh
 run test_reloc_manifest   bash tests/test_reloc_manifest.sh
 run test_all_kernels      bash tests/test_all_kernels_hsaco.sh
 
+echo "== 服务层与基准脚本（不需要 DCU / 权重，用假引擎/假依赖）=="
+run test_engine_restart   python3 tests/test_engine_restart.py
+run test_ws_quota         env PYTHONPATH="$RT_PY_DEPS${PYTHONPATH:+:$PYTHONPATH}" \
+                              "$RT_PYTHON" tests/test_ws_quota.py
+run test_bench            python3 tests/test_bench.py
+run test_kv_pool          python3 tests/test_kv_pool.py
+
 echo "== HSA 运行时（需要 DCU）=="
 run test_hsa_runtime      python3 tests/test_hsa_runtime.py
 run test_grid_dims        python3 tests/test_grid_dims.py

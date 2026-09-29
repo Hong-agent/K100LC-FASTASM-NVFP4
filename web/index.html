@@ -79,12 +79,20 @@
                          background:rgba(238,241,246,.92); color:var(--text); font-size:20px; }
 
   @media (max-width:860px) {
-    .stats { flex-wrap:nowrap; overflow-x:auto; gap:14px; scrollbar-width:none; }
+    .stats { flex-wrap:nowrap; overflow-x:auto; gap:12px; padding:2px 10px 5px; scrollbar-width:none; }
     .stats::-webkit-scrollbar { display:none; }
-    .attachbar, .filebar { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; }
+    .attachbar, .filebar { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; padding:0 10px 8px; }
     .attachbar::-webkit-scrollbar, .filebar::-webkit-scrollbar { display:none; }
     .att, .filecard { flex:0 0 auto; }
+    /* 模型输入让位：可伸缩、去掉 260px 上限，顶栏保持一行 */
+    #model { flex:1 1 auto; max-width:none; min-width:0; font-size:12.5px; }
+    /* 触屏的文件卡按钮要够大才好按 */
+    .filecard button { padding:6px 10px; font-size:12px; }
+    .filecard .fdel { padding:4px 8px; font-size:15px; }
+    .att .x { padding:6px 8px; font-size:17px; }
     .composer textarea { font-size:16px; }
+    /* 底部说明行在移动端占一整行，藏掉换输入空间 */
+    .composer-hint { display:none; }
   }
 </style>
 </head>
@@ -453,7 +461,8 @@ function renderMessages() {
     e.className = 'empty';
     e.innerHTML = '<h2>K100 LC 控制台</h2>' +
       '<p>全自研汇编器 + HSACO + HSA 运行时，全程不依赖 DTK。' +
-      '在下面输入消息开始对话，左侧可以新建/切换会话。</p>';
+      '在下面输入消息开始对话，<span class="only-desktop">左侧可以新建/切换会话</span>' +
+      '<span class="only-mobile">点左上角 ☰ 可新建/切换会话</span>。</p>';
     logEl.appendChild(e);
     return;
   }

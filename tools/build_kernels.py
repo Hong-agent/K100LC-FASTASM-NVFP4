@@ -17,12 +17,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import asm  # noqa: E402
+
+
+def _assemble_one(job: tuple[dict, str]) -> tuple[dict, bytes]:
+    """worker：汇编单个内核，返回 (spec 条目, 机器码)。"""
+    item, asm_dir = job
+    src = Path(asm_dir) / item["asm"]
+    code, _insts, _labels = asm.assemble(src)
+    return item, code
 
 
 def main() -> int:
@@ -32,6 +42,8 @@ def main() -> int:
     ap.add_argument("--out-dir", default=str(ROOT / "build"))
     ap.add_argument("--check-against", default="",
                     help="可选：把汇编结果与这个目录下同名 .bin 逐字节比较（验收用）")
+    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1),
+                    help="并行汇编进程数（1 = 串行回退，默认 min(8, CPU 数)）")
     args = ap.parse_args()
 
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
@@ -41,12 +53,24 @@ def main() -> int:
     kdir.mkdir(parents=True, exist_ok=True)
     ref_dir = Path(args.check_against) if args.check_against else None
 
-    entries, total, checked, mismatch = [], 0, 0, []
+    jobs = []
     for item in spec:
         src = asm_dir / item["asm"]
         if not src.is_file():
             raise SystemExit(f"缺少内核源码 {src}")
-        code, _insts, _labels = asm.assemble(src)
+        jobs.append((item, str(asm_dir)))
+
+    # 并行前先在主进程预热编码表缓存：Linux fork 模式下 worker 直接继承，
+    # 每个 worker 都不用再解析一遍 encodings.json。
+    if args.jobs != 1:
+        asm.load_entries()
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            results = list(ex.map(_assemble_one, jobs))
+    else:
+        results = [_assemble_one(j) for j in jobs]
+
+    entries, total, checked, mismatch = [], 0, 0, []
+    for item, code in results:
         dst = kdir / (item["name"] + ".bin")
         dst.write_bytes(code)
         total += len(code)
@@ -65,7 +89,7 @@ def main() -> int:
     (out / "all_kernels_spec.json").write_text(
         json.dumps(entries, indent=1, ensure_ascii=False), encoding="utf-8")
 
-    print(f"[build_kernels] 汇编 {len(entries)} 个内核，共 {total} 字节 → {kdir}")
+    print(f"[build_kernels] 汇编 {len(entries)} 个内核（jobs={args.jobs}），共 {total} 字节 → {kdir}")
     print(f"[build_kernels] 清单 → {out / 'all_kernels_spec.json'}")
     if ref_dir is not None:
         print(f"[build_kernels] 与参考逐字节比较：{checked - len(mismatch)}/{checked} 一致")

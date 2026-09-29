@@ -48,6 +48,8 @@ hipError_t hipHostMalloc(void** p, size_t n);
 hipError_t hipFree(void* p);
 hipError_t hipMemcpy(void* dst, const void* src, size_t n, int kind);
 hipError_t hipMemcpyAsync(void* dst, const void* src, size_t n, int kind, hipStream_t s);
+hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch,
+                            size_t width, size_t height, int kind, hipStream_t s);
 hipError_t hipMemset(void* p, int v, size_t n);
 hipError_t hipDeviceSynchronize();
 hipError_t hipStreamCreate(hipStream_t* s);

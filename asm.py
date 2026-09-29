@@ -77,13 +77,22 @@ def compile_entry(raw: dict) -> Entry:
     )
 
 
+# encodings.json 的解析结果做模块级缓存：assemble() 每个内核调用一次，
+# 80 个内核 = 80 次重复读盘 + 重建全部 Entry（实测占掉构建耗时的大头）。
+# 调用方（match/assemble）对返回的 dict 只读不写，缓存是安全的。
+_entry_cache: dict[str, list[Entry]] | None = None
+
+
 def load_entries() -> dict[str, list[Entry]]:
-    data = json.loads(ENCODINGS.read_text(encoding="utf-8"))
-    by_mnemonic: dict[str, list[Entry]] = {}
-    for raw in data:
-        entry = compile_entry(raw)
-        by_mnemonic.setdefault(entry.mnemonic, []).append(entry)
-    return by_mnemonic
+    global _entry_cache
+    if _entry_cache is None:
+        data = json.loads(ENCODINGS.read_text(encoding="utf-8"))
+        by_mnemonic: dict[str, list[Entry]] = {}
+        for raw in data:
+            entry = compile_entry(raw)
+            by_mnemonic.setdefault(entry.mnemonic, []).append(entry)
+        _entry_cache = by_mnemonic
+    return _entry_cache
 
 
 def parse_domain(domain: str, text: str) -> int | str:

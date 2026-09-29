@@ -49,10 +49,10 @@ class GenStream:
 
 
 class Engine:
-    """rt --engine 子进程的薄封装。"""
+    """rt --engine 子进程的薄封装（含崩溃自愈：引擎死了 ensure() 会重新拉起）。"""
 
     def __init__(self, model=None, json=None, cmd=None, log=None, ctx=None, mtp_n=None,
-                 no_mtp=False, env_extra=None):
+                 no_mtp=False, env_extra=None, stderr=None):
         model = model or os.environ.get('RT_RT4',
                                         os.path.join(ROOT, 'models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4'))
         json = json or os.environ.get('RT_RT4_JSON',
@@ -75,20 +75,61 @@ class Engine:
         self.mtp_n = 0 if no_mtp else (3 if mtp_n is None else int(mtp_n))
         self.log = log
         self.lock = threading.Lock()
-        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  bufsize=1, text=True, env=env)
+        self._cmd = cmd                       # 重启时原样复用
+        self._env = env
+        self._stderr = stderr                 # None=继承父进程；否则传给 Popen（bench 用来分阶段收 stderr）
+        self.epoch = 0                        # 每次 ensure 重启 +1；调用方据此作废引擎侧状态
+        self.restarts = 0                     # 累计自动重启次数（/health 展示用）
+        self._restart_times = []              # crash-loop 保护用
+        self._spawn()
+
+    def _spawn(self):
+        self.p = subprocess.Popen(self._cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=self._stderr, bufsize=1, text=True, env=self._env)
         while True:
             line = self.p.stdout.readline()
             if not line:
                 raise RuntimeError('引擎启动失败（进程退出）')
             if line.startswith('READY'):
                 break
-            if log:
+            if self.log:
                 print(f'[engine] {line.strip()}', file=sys.stderr)
 
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def ensure(self, max_restarts=3, window=300.0):
+        """引擎死了就重启（阻塞，含权重加载，秒到分钟级）；活着时是廉价 no-op。
+
+        crash-loop 保护：window 秒内已重启 max_restarts 次仍崩溃就放弃、抛
+        RuntimeError，避免驱动持续故障时无限拉起。重启成功 epoch +1 —— 引擎的
+        KV/会话状态全部清零，调用方（serve 的对话前缀缓存等）必须按 epoch 作废。
+        """
+        with self.lock:
+            if self.alive():
+                return self.epoch
+            now = time.time()
+            self._restart_times = [t for t in self._restart_times if now - t < window]
+            if len(self._restart_times) >= max_restarts:
+                raise RuntimeError(
+                    f'引擎在 {window:.0f}s 内已重启 {max_restarts} 次仍崩溃，停止自动重启')
+            code = self.p.returncode if self.p else '?'
+            print(f'[engine] 引擎已退出（code={code}），自动重启…', file=sys.stderr)
+            self._spawn()
+            self._restart_times.append(time.time())
+            self.restarts += 1
+            self.epoch += 1
+            print(f'[engine] 重启完成（epoch={self.epoch}）', file=sys.stderr)
+            return self.epoch
+
     def cmd(self, s):
-        self.p.stdin.write(s + '\n')
-        self.p.stdin.flush()
+        try:
+            self.p.stdin.write(s + '\n')
+            self.p.stdin.flush()
+        except (OSError, ValueError) as e:
+            # 引擎死掉后 stdin 是破管道（BrokenPipeError）——统一转成 RuntimeError，
+            # 调用方（serve 的自愈逻辑）只认这一种异常类型。
+            raise RuntimeError(f'引擎已退出，无法发送命令（{e}）') from e
 
     def stop(self):
         """请求中断正在进行的一次生成（引擎在 GEN 循环里非阻塞看一眼 stdin）。"""

@@ -418,6 +418,30 @@ hipError_t hipMemcpyAsync(void* dst, const void* src, size_t n, int kind, hipStr
     return hipMemcpy(dst, src, n, kind);
 }
 
+// 二维拷贝：height 行、每行 width 字节，两侧行距各自为 pitch。
+// 垫片里的 hipMemcpy 本来就是同步的（hipMemcpyAsync 只是转发），所以这里只在
+// 「行距 != 行宽」时按行拆开搬；整块连续时退化成一次拷贝。
+// KV 槽池（Model::kv_copy_slot）走的就是这条路径：live 侧按 max_ctx 的步长、
+// 槽内紧排，设备到设备。
+hipError_t hipMemcpy2DAsync(void* dst, size_t dpitch, const void* src, size_t spitch,
+                            size_t width, size_t height, int kind, hipStream_t) {
+    hsart_init(nullptr);
+    if (width == 0 || height == 0) return hipSuccess;
+    if (dpitch == width && spitch == width)          // 两侧都紧排：一次搬完
+        return hipMemcpy(dst, src, width * height, kind);
+    if (kind != hipMemcpyHostToDevice) hipDeviceSynchronize();   // 源可能刚被内核写过
+    char* d = static_cast<char*>(dst);
+    const char* s = static_cast<const char*>(src);
+    for (size_t r = 0; r < height; r++) {
+        void* dr = d + r * dpitch;
+        const void* sr = s + r * spitch;
+        if (kind == hipMemcpyHostToDevice)        copy_h2d(dr, sr, width);
+        else if (kind == hipMemcpyDeviceToHost)   copy_d2h(dr, sr, width);
+        else                                      HSA_CHECK(hsa_memory_copy(dr, sr, width));
+    }
+    return hipSuccess;
+}
+
 hipError_t hipMemset(void* p, int v, size_t n) {
     hipDeviceSynchronize();
     memset(p, v, n);
