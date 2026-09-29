@@ -3334,6 +3334,59 @@ static void engine_loop(Model& m) {
                             mtp_ema);
             }
             m.prof_print("decode");
+        } else if (op == "GEMMBENCH") {
+            // 预填充 GEMM 的微基准：对几个有代表性的形状跑 linear(y, w, x, M)，
+            // 报 ms 与 TMAC/s。同一个形状在不同 .rp4 布局下会走 NVFP4 或 RT4 的
+            // W4A8（两遍 int4 + add），于是可以直接 A/B 两种 GEMM 实现。
+            //   GEMMBENCH <steps> [M]      默认 steps=20，M 取 128/512/2048
+            int gsteps = 20, gm = 0;
+            {
+                std::istringstream gs(arg);
+                gs >> gsteps >> gm;
+            }
+            struct GBRow { const char* name; const Wq* w; bool x_is_gate; };
+            const GBRow rows[] = {
+                {"q_proj      [12288x5120]", &m.layers[3].q_proj,     false},
+                {"k_proj      [1024x5120]",  &m.layers[3].k_proj,     false},
+                {"o_proj      [5120x6144]",  &m.layers[3].o_proj,     false},
+                {"in_proj_qkv [10240x5120]", &m.layers[0].in_qkv,     false},
+                {"out_proj    [5120x6144]",  &m.layers[0].out_proj,   false},
+                {"mlp.gate    [17408x5120]", &m.layers[0].mlp_gate,   false},
+                {"mlp.down    [5120x17408]", &m.layers[0].mlp_down,   true},
+                {"lm_head     [248320x5120]", &m.lm_head,             false},
+            };
+            // 注意：M ≥ 1024 会触发内核/驱动侧的非法访问（模型里 CHUNK=512，用不到），
+            // 这里只测 128/256/512 三档。
+            const int Ms[3] = {128, 256, 512};
+            printf("GEMMBENCH steps=%d\n", gsteps);
+            for (int mi = 0; mi < 3; mi++) {
+                const int M = gm > 0 ? gm : Ms[mi];
+                if (gm > 0 && mi > 0) break;
+                for (const GBRow& r : rows) {
+                    const Wq& w = *r.w;
+                    const char* only = getenv("RT_GB_ONLY");
+                    if (only && !strstr(r.name, only)) continue;
+                    const float* x = r.x_is_gate ? m.d.m_gate : m.d.xb;
+                    float* y = m.d.m_gate;            // [4096][17408]，够大
+                    // 输出/输入都要落在已有缓冲里（M*N、M*K）
+                    if ((long long)M * w.N > (long long)4096 * 17408) continue;
+                    if ((long long)M * w.K > (long long)4096 * 17408) continue;
+                    printf("  [gb] M=%d %s N=%d K=%d %s\n", M, r.name, w.N, w.K,
+                           w.has_nvfp4() ? "NVFP4" : "int4");
+                    fflush(stdout);
+                    m.linear(y, w, x, M);             // 预热（含激活量化缓冲扩容）
+                    CK(hipDeviceSynchronize());
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < gsteps; i++) m.linear(y, w, x, M);
+                    CK(hipDeviceSynchronize());
+                    const auto t1 = std::chrono::steady_clock::now();
+                    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / gsteps;
+                    const double mac = (double)M * w.N * w.K;
+                    printf("  M=%-5d %-26s %8.3f ms  %6.1f TMAC/s  (%s)\n", M, r.name, ms,
+                           mac / (ms * 1e-3) / 1e12, w.has_nvfp4() ? "NVFP4" : "int4W4A8");
+                }
+            }
+            fflush(stdout);
         } else if (op == "MTPBENCH") {
             // 这些是调试 op，会自己乱动 seq_len / 快照，跑完不再保证和 ctx_ids 一致：
             // 直接作废对话前缀，下一轮 PREFILL 走整段重算。
