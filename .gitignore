@@ -1,0 +1,45 @@
+# ---- 权重与模型文件：第三方内容，不入库（用 scripts/fetch_model.sh 下载） ----
+models/*
+!models/README.md
+*.safetensors
+*.rt4
+*.rp4
+*.gguf
+
+# ---- 编译产物 / 测试样本 ----
+build/
+*.o
+*.bin
+!tests/expected/*.bin
+*.hsaco
+!prebuilt/*.hsaco
+!skeletons/*.hsaco
+
+# ---- 打包产物（由 scripts/make_*_package.sh 生成） ----
+dist/
+SHA256SUMS.txt
+
+# ---- 第三方二进制：驱动安装包与 hyhal 用户态快照（版权归海光，不入库；
+#      离线整包里会自带一份，只为在目标机上重装驱动用） ----
+driver/installer/*.aio.run
+driver/hyhal/*.tar.gz
+
+# ---- 自带的 Python 运行库（离线运行用，不入 git 历史） ----
+runtime/py/
+runtime/python/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ---- 网页控制台运行时工作区（会话/附件，非源码） ----
+workspaces/
+
+# ---- 本机 sudo 口令助手（明文口令，绝不入库） ----
+.askpass.sh
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store

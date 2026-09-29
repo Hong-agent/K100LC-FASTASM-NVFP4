@@ -1,0 +1,9 @@
+# 驱动安装包（推荐：不限内核版本）
+fe80b298a3d3358a869de14105ada134  ./installer/rock-5.7.1-6.2.35-V1.6.7-any-kernel.aio.run   (md5)
+787b00a8413b356a1aa22c8cd1c49703404989b4329cf1752673ee9d6a5fa384  ./installer/rock-5.7.1-6.2.35-V1.6.7-any-kernel.aio.run   (sha256)
+
+# 驱动安装包（原修正版：内核 6.8 编译修正，仍会钉内核；保留做对照）
+6ce38851cd21478ab669c9ff6b5e45d2  ./installer/rock-5.7.1-6.2.35-V1.6.7-内核68修正.aio.run   (md5)
+29132529f5a69ce18b0eb0fe86df1caed42747ed2091b628d5594a7eb87c23d5  ./installer/rock-5.7.1-6.2.35-V1.6.7-内核68修正.aio.run   (sha256)
+
+98125070b33824e99acb97b45e7cd138dda8a3ad6164dd057809a79bd60797e2  ./hyhal/hyhal-prebuilt-6.8.0-40-generic.tar.gz   (sha256)

@@ -1,0 +1,102 @@
+#!/bin/bash
+# 启动网页控制台 + OpenAI 兼容接口（网页来自 K100LC-RT4/web，后端是本项目的 build/rt）。
+#
+#   bash serve.sh                         # 默认 http://<本机IP>:8080/
+#   PORT=80 CTX=40960 MTP_N=0 bash serve.sh
+#   bash serve.sh --stop
+#
+# 前端引擎是 build/rt：自研汇编器产出的 HSACO + /opt/hyhal 的 HSA 直跑，
+# 不经过 DTK，也不经过 Docker。
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/scripts/env.sh"
+cd "$RT_ROOT"
+
+PORT="${PORT:-8080}"
+CTX="${CTX:-40960}"
+MTP_N="${MTP_N:-3}"
+PIDFILE="$RT_ROOT/build/serve.pid"
+LOGFILE="$RT_ROOT/build/serve.log"
+NO_MTP_FLAG=""
+[ "${NO_MTP:-0}" != "0" ] && NO_MTP_FLAG="--no-mtp"
+
+export RT_ENGINE_BIN="${RT_ENGINE_BIN:-$RT_ROOT/build/rt}"
+export RT_SERVED_NAME="${RT_SERVED_NAME:-qwen38-fastasm-nvfp4}"
+export RT_VISION_DEVICE="${RT_VISION_DEVICE:-gpu}"
+
+if [ "${1:-}" = "--stop" ]; then
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    SRV_PID="$(cat "$PIDFILE")"
+    # 进程组里挂着引擎子进程，杀整组，别留孤儿占显存。
+    kill -TERM -"$SRV_PID" 2>/dev/null || kill -TERM "$SRV_PID" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "已停止 serve"
+  else
+    echo "serve 未运行"
+  fi
+  exit 0
+fi
+
+if [ ! -x "$RT_ENGINE_BIN" ]; then
+  echo "缺少引擎 $RT_ENGINE_BIN，先跑：bash build.sh" >&2
+  exit 1
+fi
+if [ ! -r "$RT_MODEL_DIR/tokenizer.json" ]; then
+  echo "缺少 tokenizer：$RT_MODEL_DIR/tokenizer.json" >&2
+  echo "先跑：bash scripts/setup_models.sh" >&2
+  exit 1
+fi
+
+mkdir -p "$RT_ROOT/build"
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "serve 已在运行，PID $(cat "$PIDFILE")（日志 $LOGFILE）" >&2
+  exit 0
+fi
+
+set -o allexport
+PYTHONPATH="$RT_PY_DEPS${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+set +o allexport
+
+if command -v setsid >/dev/null 2>&1; then
+  setsid bash -c 'echo $$ >"$1"; shift; exec "$RT_PYTHON" "$@"' _ "$PIDFILE" \
+    scripts/serve.py --port "$PORT" --ctx "$CTX" \
+    --default-max-tokens "${RT_DEFAULT_MAX_TOKENS:-40960}" --mtp-n "$MTP_N" $NO_MTP_FLAG \
+    >"$LOGFILE" 2>&1 </dev/null &
+else
+  nohup "$RT_PYTHON" scripts/serve.py --port "$PORT" --ctx "$CTX" \
+    --default-max-tokens "${RT_DEFAULT_MAX_TOKENS:-40960}" --mtp-n "$MTP_N" $NO_MTP_FLAG \
+    >"$LOGFILE" 2>&1 </dev/null &
+  echo "$!" >"$PIDFILE"
+fi
+
+for _ in $(seq 1 240); do
+  if grep -q '\[serve\] 模型就绪' "$LOGFILE" 2>/dev/null; then break; fi
+  PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+    echo "启动失败，日志尾部：" >&2
+    tail -40 "$LOGFILE" >&2 || true
+    rm -f "$PIDFILE"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+# 「模型就绪」是在绑端口之前打的，端口被占用时要再确认一次，别误报成功。
+sleep 0.5
+PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null || \
+   grep -qE 'address already in use|\[Errno 98\]' "$LOGFILE" 2>/dev/null; then
+  echo "启动失败（端口 $PORT 可能被占用），日志尾部：" >&2
+  tail -20 "$LOGFILE" >&2 || true
+  kill -TERM -"$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true
+  rm -f "$PIDFILE"
+  exit 1
+fi
+
+LAN_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^172\.17\.' | head -1)"
+echo "网页控制台已启动（引擎 $RT_ENGINE_BIN）"
+echo "  网页 : http://${LAN_IP:-127.0.0.1}:$PORT/"
+echo "  接口 : http://${LAN_IP:-127.0.0.1}:$PORT/v1"
+echo "  日志 : tail -f $LOGFILE"
+echo "  停止 : bash serve.sh --stop"

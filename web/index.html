@@ -1,0 +1,1109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#eef1f6">
+<title>K100 LC 控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2310a37f'/%3E%3Ctext x='16' y='22' font-size='17' font-family='monospace' text-anchor='middle' fill='white'%3EK%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+<style>
+  /* K100LC 专有组件：沿用 codex-lan-web 的配色变量，布局与交互保持一致 */
+  .status .spacer, .composer .spacer { flex: 1; }
+  .brand .logo { background: linear-gradient(135deg, var(--accent), #0b8f9a); }
+  #model { flex: 0 1 260px; max-width: 260px; font-family: var(--mono); font-size: 13px; }
+
+  .stats { display:flex; flex-wrap:wrap; gap:4px 16px; padding:2px 16px 6px;
+           color:var(--muted); font-size:12px; }
+  .stats b { color:var(--text); font-weight:600; }
+  .composer-hint { padding:0 16px 10px; color:var(--muted); font-size:11.5px; }
+
+  .attachbar, .filebar { display:none; flex-wrap:wrap; gap:8px; padding:0 16px 8px; }
+  .attachbar.show, .filebar.show { display:flex; }
+  .att, .filecard { display:flex; align-items:center; gap:8px; max-width:280px;
+                    padding:6px 8px; border:1px solid var(--border); border-radius:11px;
+                    background:var(--panel); font-size:12px; box-shadow:var(--shadow-sm); }
+  .att.error, .filecard.error { border-color:var(--danger); }
+  .att img { width:42px; height:42px; object-fit:cover; border-radius:7px; display:block; }
+  .att .meta { min-width:0; }
+  .att .name, .filecard .fname { display:block; overflow:hidden; text-overflow:ellipsis;
+                                 white-space:nowrap; max-width:160px; }
+  .att .sub, .filecard .fsub { color:var(--muted); font-size:11px; }
+  .att .x { border:0; background:transparent; color:var(--muted); padding:2px 4px; font-size:16px;
+            box-shadow:none; }
+  .att .x:hover { color:var(--text); background:transparent; }
+  .filecard button { padding:3px 7px; font-size:11px; border-radius:7px; }
+  .filecard .fdel { border:0; background:transparent; color:var(--muted); padding:2px 5px;
+                    font-size:14px; border-radius:7px; box-shadow:none; }
+  .filecard .fdel:hover { color:var(--danger); background:rgba(214,69,65,.08); }
+  .filebar .fclear { align-self:center; padding:4px 10px; font-size:11.5px; color:var(--muted);
+                     border-radius:8px; }
+  .filebar .fclear:hover { color:var(--danger); border-color:var(--danger); }
+
+  .bubble .attachments { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .bubble .attachments img { max-width:min(360px,100%); max-height:260px; border-radius:10px;
+                             display:block; border:1px solid rgba(28,38,52,.12); }
+  .bubble .doc { padding:6px 8px; border:1px solid rgba(28,38,52,.14); border-radius:9px;
+                 background:rgba(20,30,45,.05); font-size:12px; }
+
+  .skills { display:none; margin-bottom:4px; }
+  .skills.show { display:block; }
+  .skillline { font-size:12px; color:var(--muted); padding:2px 0; }
+  .skillline b { color:var(--accent); font-weight:600; }
+
+  /* 思考段：可折叠，流式期间默认展开，正文出现后自动收起 */
+  .thinkbox { display:none; margin:2px 0 8px; border-left:2px solid var(--border); padding-left:8px; }
+  .thinkbox.show { display:block; }
+  .thinkhead { cursor:pointer; user-select:none; font-size:12px; color:var(--muted);
+               display:flex; align-items:baseline; gap:6px; padding:2px 0; }
+  .thinkhead:hover { color:var(--text); }
+  .thinkhead .arrow { display:inline-block; transition:transform .15s; font-size:9px;
+                      transform:rotate(0deg); flex:none; }
+  .thinkbox.open .thinkhead .arrow { transform:rotate(90deg); }
+  .thinkhead .tlabel { flex:none; }
+  .thinkhead .tpreview { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                         white-space:nowrap; opacity:.7; }
+  .thinkbox.open .thinkhead .tpreview { display:none; }
+  /* 思考段现在是 Markdown 渲染出来的 HTML，不能再按 pre-wrap 排，否则空行翻倍 */
+  .thinkbody { display:none; font-size:12px; color:var(--muted);
+               max-height:340px; overflow:auto; padding:4px 0 6px; }
+  .thinkbox.open .thinkbody { display:block; }
+
+  #previewBody img { max-width:100%; max-height:70vh; display:block; margin:auto; }
+  #previewBody iframe { width:100%; height:70vh; border:0; background:#fff; }
+  #previewBody pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:12.5px; }
+
+  body.dragging::after { content:"松开即可添加图片或文档"; position:fixed; inset:12px; z-index:70;
+                         display:flex; align-items:center; justify-content:center;
+                         border:2px dashed var(--accent); border-radius:18px;
+                         background:rgba(238,241,246,.92); color:var(--text); font-size:20px; }
+
+  @media (max-width:860px) {
+    .stats { flex-wrap:nowrap; overflow-x:auto; gap:14px; scrollbar-width:none; }
+    .stats::-webkit-scrollbar { display:none; }
+    .attachbar, .filebar { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; }
+    .attachbar::-webkit-scrollbar, .filebar::-webkit-scrollbar { display:none; }
+    .att, .filecard { flex:0 0 auto; }
+    .composer textarea { font-size:16px; }
+  }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="sidebar-backdrop hidden" id="sidebarBackdrop"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <div class="brand">
+        <span class="logo">K</span>
+        <div>
+          <div class="brand-title">K100 LC 控制台</div>
+          <div class="brand-sub" id="brandSub">自研 HSACO · 无 DTK</div>
+        </div>
+      </div>
+    </div>
+    <button class="new-chat" id="newChatBtn">＋ 新对话</button>
+    <div class="thread-list" id="threadList"></div>
+    <div class="sidebar-foot">
+      <div class="foot-row">
+        <span class="dot" id="connDot"></span>
+        <span id="connText">连接中…</span>
+      </div>
+      <div class="foot-actions">
+        <span class="thread-sub" id="mtpText"></span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn mobile-only" id="menuBtn" title="会话列表">☰</button>
+      <div class="cwd-wrap">
+        <label for="model">模型</label>
+        <input id="model" class="cwd-input" list="modelOptions" value="qwen38-rt"
+               spellcheck="false" placeholder="模型名（不校验）">
+        <datalist id="modelOptions"></datalist>
+      </div>
+      <div class="topbar-actions">
+        <button class="ghost-btn" id="filesBtn">文件</button>
+        <button class="ghost-btn" id="settingsBtn">设置</button>
+      </div>
+    </header>
+
+    <section class="settings hidden" id="controls">
+      <div class="field">
+        <label for="effort">思考</label>
+        <select id="effort">
+          <option value="low" selected>low</option>
+          <option value="medium">medium</option>
+          <option value="xhigh">xhigh</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="temp">温度</label>
+        <input id="temp" type="number" value="0" step="0.1" min="0" max="2">
+      </div>
+      <div class="field">
+        <label for="maxTokens">最多 token</label>
+        <input id="maxTokens" type="number" value="40960" min="1" max="262144">
+      </div>
+      <div class="field checkbox">
+        <label><input id="skills" type="checkbox" checked> 技能</label>
+        <span class="hint">让模型可以调用计算、文件等工具</span>
+      </div>
+      <div class="settings-note" id="capHint"></div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button class="ghost-btn" id="clear">清空当前会话</button>
+      </div>
+    </section>
+
+    <section class="messages" id="log"></section>
+
+    <div class="stats">
+      <span>预填充 <b id="sPrefill">—</b></span>
+      <span>生成 <b id="sGen">—</b></span>
+      <span>实时 <b id="sLive">—</b></span>
+      <span>首 token <b id="sTtft">—</b></span>
+      <span>本轮 <b id="sTokens">0 tok</b></span>
+    </div>
+    <div id="fileBar" class="filebar"></div>
+    <div id="attachBar" class="attachbar"></div>
+
+    <footer class="composer">
+      <input id="files" type="file" multiple hidden
+             accept="image/*,.txt,.md,.markdown,.json,.csv,.tsv,.log,.html,.htm,.xml,.yaml,.yml,.toml,.ini,.cfg,.conf,.py,.cpp,.cc,.c,.h,.hpp,.hip,.cu,.js,.ts,.sh,.bash,.sql,.rst,.tex,.srt,.pdf,.docx,.pptx,.xlsx,.rtf,.odt">
+      <button class="ghost-btn" id="attach" type="button" title="上传文档或图片">＋</button>
+      <textarea id="input" rows="1" placeholder="给 K100LC 发消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button class="send-btn" id="send">发送</button>
+      <button class="danger-btn hidden" id="stop">停止</button>
+    </footer>
+    <div class="composer-hint">
+      自研 HSACO + HSA 运行时，无 DTK；流式输出。模型名不校验；思考内容也占 token。
+    </div>
+  </main>
+</div>
+
+<div class="modal hidden" id="preview">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong id="previewName">文件预览</strong>
+      <div class="spacer"></div>
+      <a id="previewDownload" class="ghost-btn" href="#" download>下载</a>
+      <button class="icon-btn" id="previewClose">✕</button>
+    </div>
+    <div class="modal-body" id="previewBody"></div>
+  </div>
+</div>
+
+<script src="/markdown.js"></script>
+<script>
+// ---- Markdown 渲染 -------------------------------------------------------
+// 助手输出按 Markdown 渲染；流式期间每个 delta 都整篇重排太浪费，做 80ms 节流，
+// 收尾时强制刷一次。用户消息仍是纯文本（不把用户输入里的符号当格式）。
+function makeMdRenderer() {
+  let timer = null, el = null, text = '';
+  return function render(target, value, immediate) {
+    el = target;
+    text = value == null ? '' : String(value);
+    if (immediate) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (el) el.innerHTML = window.renderMarkdown(text);
+      return;
+    }
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      if (el) el.innerHTML = window.renderMarkdown(text);
+    }, 80);
+  };
+}
+const renderAnswer = makeMdRenderer();
+const renderThinkMd = makeMdRenderer();
+
+// 代码块「复制」：局域网是 http 访问，navigator.clipboard 不可用，退回 textarea。
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-1000px';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    ok ? resolve() : reject(new Error('copy failed'));
+  });
+}
+
+const logEl = document.getElementById('log');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const stopBtn = document.getElementById('stop');
+const clearBtn = document.getElementById('clear');
+const modelEl = document.getElementById('model');
+const modelOptions = document.getElementById('modelOptions');
+const effortEl = document.getElementById('effort');
+const tempEl = document.getElementById('temp');
+const maxEl = document.getElementById('maxTokens');
+const dotEl = document.getElementById('connDot');
+const statusEl = document.getElementById('connText');
+const mtpEl = document.getElementById('mtpText');
+const brandSub = document.getElementById('brandSub');
+const sPrefill = document.getElementById('sPrefill');
+const sGen = document.getElementById('sGen');
+const sLive = document.getElementById('sLive');
+const sTtft = document.getElementById('sTtft');
+const sTokens = document.getElementById('sTokens');
+const filesEl = document.getElementById('files');
+const attachBtn = document.getElementById('attach');
+const attachBar = document.getElementById('attachBar');
+const capHint = document.getElementById('capHint');
+const skillsEl = document.getElementById('skills');
+const fileBar = document.getElementById('fileBar');
+let filesVisible = true;      // 文件栏显隐（用户点「文件」按钮切换）
+const previewEl = document.getElementById('preview');
+const previewName = document.getElementById('previewName');
+const previewBody = document.getElementById('previewBody');
+const previewDownload = document.getElementById('previewDownload');
+const previewClose = document.getElementById('previewClose');
+const settingsBtn = document.getElementById('settingsBtn');
+const controlsEl = document.getElementById('controls');
+const filesBtn = document.getElementById('filesBtn');
+const threadListEl = document.getElementById('threadList');
+const newChatBtn = document.getElementById('newChatBtn');
+const sidebarEl = document.getElementById('sidebar');
+const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+const menuBtn = document.getElementById('menuBtn');
+
+let controller = null;
+let attachments = [];
+let caps = { vision:false, max_upload_mb:25 };
+let threads = [];
+let current = null;
+
+const LS_THREADS = 'k100lc.threads.v1';
+const LS_CURRENT = 'k100lc.current.v1';
+
+function uid() {
+  return (crypto.randomUUID && crypto.randomUUID()) ||
+         (Date.now() + '-' + Math.random().toString(16).slice(2));
+}
+
+// ---------------------------------------------------------------- 会话管理 --
+function loadThreads() {
+  try { threads = JSON.parse(localStorage.getItem(LS_THREADS) || '[]') || []; }
+  catch (e) { threads = []; }
+  if (!Array.isArray(threads)) threads = [];
+}
+
+function saveThreads() {
+  // 图片 dataURL 不落盘，避免 localStorage 爆掉；正文/文档摘要保留。
+  const slim = threads.slice(0, 60).map(t => ({
+    id: t.id, conversationId: t.conversationId, title: t.title,
+    createdAt: t.createdAt, updatedAt: t.updatedAt,
+    messages: (t.messages || []).slice(-200).map(m => ({
+      role: m.role, text: m.text || '',
+      atts: (m.atts || []).map(a => ({ name: a.name, kind: a.kind, chars: a.chars || 0 })),
+    })),
+  }));
+  try { localStorage.setItem(LS_THREADS, JSON.stringify(slim)); } catch (e) {}
+  if (current) localStorage.setItem(LS_CURRENT, current.id);
+}
+
+function newThread(select = true) {
+  const t = {
+    id: uid(), conversationId: uid(), title: '新对话',
+    createdAt: Date.now(), updatedAt: Date.now(), messages: [],
+  };
+  threads.unshift(t);
+  if (select) selectThread(t.id);
+  saveThreads();
+  return t;
+}
+
+function selectThread(id) {
+  current = threads.find(t => t.id === id) || null;
+  if (!current) current = newThread(true);
+  localStorage.setItem(LS_CURRENT, current.id);
+  renderMessages();
+  renderThreads();
+  refreshFiles();
+  closeSidebar();
+}
+
+function renderThreads() {
+  threadListEl.innerHTML = '';
+  if (!threads.length) {
+    const d = document.createElement('div');
+    d.className = 'thread-sub';
+    d.style.padding = '10px 12px';
+    d.textContent = '还没有会话';
+    threadListEl.appendChild(d);
+    return;
+  }
+  for (const t of threads) {
+    const item = document.createElement('div');
+    item.className = 'thread-item' + (current && t.id === current.id ? ' active' : '');
+    const main = document.createElement('div');
+    main.className = 'thread-main';
+    const title = document.createElement('div');
+    title.className = 'thread-title';
+    title.textContent = t.title || '新对话';
+    const sub = document.createElement('div');
+    sub.className = 'thread-sub';
+    sub.innerHTML = '<span class="thread-tag">K100LC</span> · ' + fmtWhen(t.updatedAt);
+    main.append(title, sub);
+    const del = document.createElement('button');
+    del.className = 'thread-del';
+    del.type = 'button';
+    del.title = '删除会话';
+    del.textContent = '✕';
+    del.onclick = (e) => {
+      e.stopPropagation();
+      threads = threads.filter(x => x.id !== t.id);
+      if (current && current.id === t.id) {
+        if (threads.length) selectThread(threads[0].id);
+        else newThread(true);
+      }
+      saveThreads();
+      renderThreads();
+    };
+    item.append(main, del);
+    item.onclick = () => selectThread(t.id);
+    threadListEl.appendChild(item);
+  }
+}
+
+function fmtWhen(ts) {
+  if (!ts) return '';
+  const d = Date.now() - ts;
+  if (d < 60e3) return '刚刚';
+  if (d < 3600e3) return Math.floor(d / 60e3) + ' 分钟前';
+  const dt = new Date(ts);
+  return dt.toLocaleDateString('zh-CN', { month:'numeric', day:'numeric' }) + ' ' +
+         dt.toTimeString().slice(0, 5);
+}
+
+function updateThreadTitle() {
+  if (!current) return;
+  const first = current.messages.find(m => m.role === 'user');
+  if (first) current.title = (first.text || '新对话').replace(/\s+/g, ' ').slice(0, 40);
+}
+
+// ---------------------------------------------------------------- 渲染消息 --
+function clearEmpty() {
+  const e = logEl.querySelector('.empty');
+  if (e) e.remove();
+}
+
+function addMessage(role, text, atts = []) {
+  clearEmpty();
+  const row = document.createElement('div');
+  row.className = 'msg ' + role;
+  if (role !== 'user') {
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = 'K';
+    row.appendChild(avatar);
+  }
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (role === 'assistant') bubble.classList.add('markdown');
+  const skillsEl = document.createElement('div');
+  skillsEl.className = 'skills';
+  bubble.appendChild(skillsEl);
+  const textEl = document.createElement('div');
+  textEl.className = 'bubble-text';
+  if (role === 'assistant') renderAnswer(textEl, text || '', true);
+  else textEl.textContent = text || '';
+  bubble.appendChild(textEl);
+  if (atts && atts.length) {
+    const box = document.createElement('div');
+    box.className = 'attachments';
+    for (const a of atts) {
+      if (a.kind === 'image' && a.dataUrl) {
+        const img = document.createElement('img');
+        img.src = a.dataUrl;
+        img.alt = a.name || '图片';
+        img.title = a.name + (caps.vision ? '' : '（当前模型未启用视觉，仅展示）');
+        box.appendChild(img);
+      } else {
+        const doc = document.createElement('div');
+        doc.className = 'doc';
+        doc.textContent = '📄 ' + (a.name || '文档') + ' · ' + (a.chars || 0) + ' 字' +
+                          (a.truncated ? '（已截断）' : '');
+        box.appendChild(doc);
+      }
+    }
+    bubble.appendChild(box);
+  }
+  row.appendChild(bubble);
+  logEl.appendChild(row);
+  logEl.scrollTop = logEl.scrollHeight;
+  return { row, bubble, textEl, skillsEl };
+}
+
+function renderMessages() {
+  logEl.innerHTML = '';
+  const msgs = (current && current.messages) || [];
+  if (!msgs.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.innerHTML = '<h2>K100 LC 控制台</h2>' +
+      '<p>全自研汇编器 + HSACO + HSA 运行时，全程不依赖 DTK。' +
+      '在下面输入消息开始对话，左侧可以新建/切换会话。</p>';
+    logEl.appendChild(e);
+    return;
+  }
+  for (const m of msgs) addMessage(m.role, m.text || '', m.atts || []);
+}
+
+// ---------------------------------------------------------------- 连接状态 --
+function setStatus(ok, text) {
+  dotEl.className = 'dot ' + (ok ? 'ok' : 'bad');
+  statusEl.textContent = text;
+}
+
+async function health() {
+  try {
+    const r = await fetch('/health');
+    const j = await r.json();
+    setStatus(true, '已连接 · ' + (j.model || ''));
+    brandSub.textContent = (j.model || 'K100LC') + (j.mtp ? ' · MTP×' + j.mtp : '');
+    mtpEl.textContent = j.mtp ? 'MTP×' + j.mtp + ' · 自研 HSACO' : '自研 HSACO · 无 DTK';
+    if (j.model && ![...modelOptions.options].some(o => o.value === j.model)) {
+      const o = document.createElement('option');
+      o.value = j.model;
+      modelOptions.appendChild(o);
+    }
+  } catch (e) {
+    setStatus(false, '未连接');
+  }
+}
+
+async function loadCaps() {
+  try {
+    const r = await fetch('/v1/capabilities');
+    if (r.ok) caps = await r.json();
+  } catch (e) { /* 旧服务没有这个接口时按纯文本模式处理 */ }
+  capHint.textContent = caps.vision
+    ? '图片会先交给视觉模型识别，再连同文字一起送入 RT4。文档会提取为文本。'
+    : '支持上传图片和文档；文档会提取为文本。当前 RT4 运行时未启用视觉时图片仅展示。';
+  updateSendState();
+  renderAttachments();
+}
+
+health();
+loadCaps();
+setInterval(health, 15000);
+
+function fmtSize(n) {
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function base64SafeLimit(mb) {
+  return Math.floor((mb || 25) * 1024 * 1024 * 0.72);
+}
+
+function fileURL(name, download) {
+  return '/v1/files/' + encodeURIComponent(name) +
+         '?conversation_id=' + encodeURIComponent(current ? current.conversationId : '') +
+         (download ? '&download=1' : '');
+}
+
+async function refreshFiles() {
+  if (!current) return;
+  try {
+    const r = await fetch('/v1/files?conversation_id=' +
+                           encodeURIComponent(current.conversationId));
+    if (!r.ok) return;
+    const j = await r.json();
+    renderFileBar(j.files || []);
+  } catch (e) { /* 旧服务没有文件接口 */ }
+}
+
+function renderFileBar(files) {
+  fileBar.innerHTML = '';
+  for (const f of files) {
+    const card = document.createElement('div');
+    card.className = 'filecard';
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.textContent = '📄 ' + f.name;
+    name.title = f.name;
+    const sub = document.createElement('span');
+    sub.className = 'fsub';
+    sub.textContent = fmtSize(f.size);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.textContent = '打开';
+    open.onclick = () => openPreview(f);
+    const dl = document.createElement('a');
+    dl.href = fileURL(f.name, true);
+    dl.download = f.name;
+    const dlBtn = document.createElement('button');
+    dlBtn.type = 'button';
+    dlBtn.textContent = '下载';
+    dl.appendChild(dlBtn);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'fdel';
+    del.textContent = '✕';
+    del.title = '删除这个文件';
+    del.onclick = async () => { if (await deleteFile(f)) refreshFiles(); };
+    card.append(name, sub, open, dl, del);
+    fileBar.appendChild(card);
+  }
+  if (files.length > 1) {
+    const all = document.createElement('button');
+    all.type = 'button';
+    all.className = 'fclear';
+    all.textContent = '全部清除';
+    all.title = '删除本会话工作区里的全部文件';
+    all.onclick = clearFiles;
+    fileBar.appendChild(all);
+  }
+  // 有文件才显示；但显隐本身尊重用户用「文件」按钮做的选择
+  fileBar.classList.toggle('show', files.length > 0 && filesVisible);
+}
+
+async function deleteFile(f, quiet) {
+  if (!current) return false;
+  let ok = false;
+  try {
+    const r = await fetch('/v1/files/' + encodeURIComponent(f.name) +
+                          '?conversation_id=' + encodeURIComponent(current.conversationId),
+                          { method: 'DELETE' });
+    ok = r.ok;
+  } catch (e) { ok = false; }
+  if (!ok && !quiet) alert('删除失败：' + f.name);
+  // 正在预览这个文件就顺手关掉，别留着一个已经删掉的预览
+  if (ok && previewName.textContent === f.name) previewEl.classList.add('hidden');
+  return ok;
+}
+
+async function clearFiles() {
+  if (!current) return;
+  const r = await fetch('/v1/files?conversation_id=' +
+                        encodeURIComponent(current.conversationId));
+  const files = r.ok ? ((await r.json()).files || []) : [];
+  if (!files.length) return;
+  if (!confirm('删除本会话工作区里的 ' + files.length + ' 个文件？删除后不可恢复。')) return;
+  let done = 0;
+  for (const f of files) if (await deleteFile(f, true)) done++;
+  previewEl.classList.add('hidden');
+  refreshFiles();
+  if (done !== files.length) alert('有 ' + (files.length - done) + ' 个文件没能删掉');
+}
+
+async function openPreview(f) {
+  previewEl.classList.remove('hidden');
+  previewName.textContent = f.name;
+  previewDownload.href = fileURL(f.name, true);
+  previewDownload.download = f.name;
+  previewBody.innerHTML = '';
+  const ext = (f.ext || '').toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif'].includes(ext)) {
+    const img = document.createElement('img');
+    img.src = fileURL(f.name, false);
+    previewBody.appendChild(img);
+    return;
+  }
+  if (ext === 'pdf' || ext === 'html' || ext === 'htm') {
+    const frame = document.createElement('iframe');
+    frame.setAttribute('sandbox', 'allow-same-origin');
+    frame.src = fileURL(f.name, false);
+    previewBody.appendChild(frame);
+    return;
+  }
+  const pre = document.createElement('pre');
+  try {
+    const r = await fetch(fileURL(f.name, false));
+    pre.textContent = (await r.text()).slice(0, 200000);
+  } catch (e) {
+    pre.textContent = '读取失败：' + e.message;
+  }
+  previewBody.appendChild(pre);
+}
+
+previewClose.onclick = () => previewEl.classList.add('hidden');
+previewEl.addEventListener('click', (e) => {
+  if (e.target === previewEl) previewEl.classList.add('hidden');
+});
+
+// Markdown 代码块的「复制」按钮（事件委托，渲染出来的按钮不用逐个绑定）
+logEl.addEventListener('click', async (e) => {
+  const btn = e.target.closest && e.target.closest('.codeblock .copy');
+  if (!btn) return;
+  const code = btn.parentElement.querySelector('code');
+  const label = btn.textContent;
+  try {
+    await copyText(code ? code.textContent : '');
+    btn.textContent = '已复制';
+  } catch (err) {
+    btn.textContent = '复制失败';
+  }
+  setTimeout(() => { btn.textContent = label; }, 1200);
+});
+
+function humanSize(n) {
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function renderAttachments() {
+  attachBar.innerHTML = '';
+  for (const a of attachments) {
+    const chip = document.createElement('div');
+    chip.className = 'att' + (a.error ? ' error' : '');
+    if (a.kind === 'image' && a.dataUrl) {
+      const img = document.createElement('img');
+      img.src = a.dataUrl;
+      img.alt = a.name;
+      chip.appendChild(img);
+    } else {
+      const icon = document.createElement('span');
+      icon.textContent = '📄';
+      chip.appendChild(icon);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = a.name;
+    name.title = a.name;
+    const sub = document.createElement('span');
+    sub.className = 'sub';
+    if (a.error) {
+      sub.textContent = a.error;
+    } else if (a.kind === 'image') {
+      sub.textContent = humanSize(a.size) + (caps.vision ? ' · 视觉' : ' · 仅展示');
+    } else if (a.status === 'loading') {
+      sub.textContent = '解析中…';
+    } else {
+      sub.textContent = (a.chars || 0) + ' 字' + (a.truncated ? ' · 已截断' : '');
+    }
+    meta.appendChild(name);
+    meta.appendChild(sub);
+    chip.appendChild(meta);
+    const x = document.createElement('button');
+    x.className = 'x';
+    x.type = 'button';
+    x.textContent = '×';
+    x.title = '移除';
+    x.onclick = () => {
+      attachments = attachments.filter(item => item.id !== a.id);
+      renderAttachments();
+    };
+    chip.appendChild(x);
+    attachBar.appendChild(chip);
+  }
+  attachBar.classList.toggle('show', attachments.length > 0);
+  updateSendState();
+}
+
+function updateSendState() {
+  const usable = attachments.some(a => (a.kind === 'image' && a.dataUrl) || a.status === 'ok');
+  const loading = attachments.some(a => a.kind === 'document' && a.status === 'loading');
+  sendBtn.disabled = !!controller || loading || (!inputEl.value.trim() && !usable);
+}
+
+function readDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error('读取失败'));
+    r.readAsDataURL(file);
+  });
+}
+
+async function extractFile(file, att) {
+  try {
+    const r = await fetch('/v1/extract?name=' + encodeURIComponent(file.name), {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    if (!r.ok) throw new Error((await r.text()).slice(0, 200) || ('HTTP ' + r.status));
+    const j = await r.json();
+    att.status = 'ok';
+    att.text = j.text || '';
+    att.chars = j.chars || 0;
+    att.truncated = !!j.truncated;
+    att.warning = j.warning || '';
+  } catch (e) {
+    att.status = 'error';
+    att.error = e.message || '解析失败';
+  }
+  renderAttachments();
+}
+
+async function handleFiles(list) {
+  const maxBytes = (caps.max_upload_mb || 25) * 1024 * 1024;
+  for (const file of list) {
+    const id = uid();
+    const isImage = (file.type || '').startsWith('image/') ||
+                    /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(file.name || '');
+    if (file.size > maxBytes) {
+      attachments.push({ id, name:file.name, size:file.size, kind:isImage ? 'image' : 'document',
+                         error:'超过 ' + (caps.max_upload_mb || 25) + 'MB 上限' });
+      continue;
+    }
+    if (isImage) {
+      const imgBytes = base64SafeLimit(caps.max_upload_mb || 25);
+      if (file.size > imgBytes) {
+        attachments.push({ id, name:file.name, size:file.size, kind:'image',
+                           error:'图片超过 ' + (caps.max_upload_mb || 25) + 'MB，无法附加' });
+        continue;
+      }
+      try {
+        const dataUrl = await readDataUrl(file);
+        attachments.push({ id, name:file.name, size:file.size, kind:'image', dataUrl });
+      } catch (e) {
+        attachments.push({ id, name:file.name, size:file.size, kind:'image',
+                           error:'读取失败' });
+      }
+    } else {
+      const att = { id, name:file.name, size:file.size, kind:'document', status:'loading' };
+      attachments.push(att);
+      renderAttachments();
+      await extractFile(file, att);
+    }
+  }
+  renderAttachments();
+}
+
+function composeText() {
+  const typed = inputEl.value.trim();
+  const parts = [];
+  for (const a of attachments) {
+    if (a.kind === 'document' && a.status === 'ok' && a.text) {
+      const safeName = a.name.replace(/"/g, "'");
+      parts.push('<document name="' + safeName + '">\n' + a.text + '\n</document>');
+    }
+  }
+  if (typed) parts.push(typed);
+  if (!typed && attachments.some(a => a.kind === 'image')) parts.push('请查看上传的图片。');
+  return parts.join('\n\n');
+}
+
+function buildUserContent(text, atts) {
+  const images = (atts || attachments).filter(a => a.kind === 'image' && a.dataUrl);
+  if (!images.length) return text;
+  const content = [{ type:'text', text: text || '请查看上传的图片。' }];
+  for (const a of images) {
+    content.push({ type:'image_url', name:a.name, image_url:{ url:a.dataUrl } });
+  }
+  return content;
+}
+
+// ---------------------------------------------------------------- 会话发送 --
+async function send() {
+  if (controller) return;
+  if (!current) newThread(true);
+  const typed = inputEl.value.trim();
+  const ready = attachments.every(a => (a.kind === 'image' && a.dataUrl) || a.status === 'ok');
+  const usable = typed || attachments.some(a => (a.kind === 'image' && a.dataUrl) ||
+                                              a.status === 'ok');
+  if (!ready || !usable) return;
+  const text = composeText();
+  const userAtts = attachments.slice();
+  inputEl.value = '';
+  attachments = [];
+  renderAttachments();
+  const shown = typed || (userAtts.some(a => a.kind === 'image') ? '（图片）' : '（文档）');
+  addMessage('user', shown, userAtts);
+  current.messages.push({ role:'user', content: buildUserContent(text, userAtts),
+                          text: shown, atts: userAtts });
+  updateThreadTitle();
+  current.updatedAt = Date.now();
+  renderThreads();
+
+  const am = addMessage('assistant', '');
+  const bubble = am.bubble;
+  const textEl = am.textEl;
+  bubble.classList.add('thinking');
+  const thinkWrap = document.createElement('div');
+  thinkWrap.className = 'thinkbox open';
+  thinkWrap.innerHTML =
+    '<div class="thinkhead"><span class="arrow">▶</span>' +
+    '<span class="tlabel">💭 思考过程</span><span class="tpreview"></span></div>' +
+    '<div class="thinkbody"></div>';
+  bubble.insertBefore(thinkWrap, textEl);
+  const thinkHead = thinkWrap.querySelector('.thinkhead');
+  const thinkLabel = thinkWrap.querySelector('.tlabel');
+  const thinkPreview = thinkWrap.querySelector('.tpreview');
+  const thinkBody = thinkWrap.querySelector('.thinkbody');
+  let thinkUserToggled = false;
+  thinkHead.addEventListener('click', () => {
+    thinkWrap.classList.toggle('open');
+    thinkUserToggled = true;
+  });
+  let thinkText = '';
+  let thinkAutoCollapsed = false;
+  function renderThink() {
+    if (!thinkText) return;
+    renderThinkMd(thinkBody, thinkText);     // 思考段也按 Markdown 排（同样节流）
+    thinkLabel.textContent = '💭 思考过程 · ' + thinkText.length + ' 字';
+    const tail = thinkText.trimEnd().split('\n').filter(Boolean).slice(-1)[0] || '';
+    thinkPreview.textContent = tail.slice(-60);
+    thinkWrap.classList.add('show');
+  }
+  const waitEl = document.createElement('div');
+  waitEl.className = 'skillline waitline';
+  waitEl.textContent = '⏳ 正在处理… 0.0s';
+  am.skillsEl.appendChild(waitEl);
+  am.skillsEl.classList.add('show');
+  const waitT0 = performance.now();
+  const waitTimer = setInterval(() => {
+    waitEl.textContent = '⏳ 正在处理… ' +
+                         ((performance.now() - waitT0) / 1000).toFixed(1) + 's';
+  }, 200);
+  const clearWait = () => { clearInterval(waitTimer); waitEl.remove(); };
+  let answer = '';
+  let mdFlush = true;                 // 收尾时是否需要把 Markdown 再刷一次
+  let chunkCount = 0;
+  let chunkTimes = [];
+  sPrefill.textContent = '—';
+  sGen.textContent = '—';
+  sLive.textContent = '—';
+  sTtft.textContent = '—';
+  sTokens.textContent = '0 tok';
+  controller = new AbortController();
+  sendBtn.disabled = true;
+  stopBtn.disabled = false;
+  stopBtn.classList.remove('hidden');
+
+  try {
+    const body = {
+      model: modelEl.value.trim() || 'qwen38-rt',
+      messages: current.messages.map(m => ({
+        role: m.role,
+        content: (m.content !== undefined ? m.content : (m.text || '')),
+      })),
+      max_tokens: Math.max(1, parseInt(maxEl.value || '40960', 10)),
+      temperature: parseFloat(tempEl.value || '0'),
+      stream: true,
+      conversation_id: current.conversationId,
+      skills: skillsEl.checked,
+    };
+    if (effortEl.value === 'off') {
+      body.enable_thinking = false;
+    } else {
+      body.reasoning_effort = effortEl.value;
+    }
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error('HTTP ' + resp.status + ': ' + t.slice(0, 300));
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const j = JSON.parse(data);
+            if (j.type === 'skill') {
+              const ev = j.skill || {};
+              const line = document.createElement('div');
+              line.className = 'skillline';
+              line.textContent = '🔧 ' + (ev.name || 'skill') + ' → ' +
+                                 String(ev.result == null ? '' : ev.result).slice(0, 300);
+              am.skillsEl.appendChild(line);
+              am.skillsEl.classList.add('show');
+              logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (j.type === 'round_reset') {
+              answer = '';
+              renderAnswer(textEl, '', true);
+              thinkText = '';
+              thinkBody.textContent = '';
+              thinkPreview.textContent = '';
+              thinkWrap.classList.remove('show');
+              thinkWrap.classList.add('open');
+              thinkAutoCollapsed = false;
+              thinkUserToggled = false;
+            }
+            if (j.type === 'error') {
+              textEl.textContent = '请求失败：' + (j.message || '未知错误');
+            }
+            const rdelta = j.choices?.[0]?.delta?.reasoning_content || '';
+            if (rdelta) {
+              clearWait();
+              thinkText += rdelta;
+              renderThink();
+              if (thinkWrap.classList.contains('open')) logEl.scrollTop = logEl.scrollHeight;
+            }
+            const delta = j.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              clearWait();
+              if (!thinkAutoCollapsed && !thinkUserToggled && thinkText) {
+                thinkAutoCollapsed = true;
+                thinkWrap.classList.remove('open');
+              }
+              answer += delta;
+              renderAnswer(textEl, answer);
+              logEl.scrollTop = logEl.scrollHeight;
+              const now = performance.now();
+              chunkCount += 1;
+              chunkTimes.push(now);
+              if (chunkTimes.length > 300) chunkTimes.shift();
+              const recent = chunkTimes.filter(t => t >= now - 2000);
+              if (recent.length > 1) {
+                const live = (recent.length - 1) /
+                             Math.max(1e-6, (recent[recent.length - 1] - recent[0]) / 1000);
+                sLive.textContent = live.toFixed(1) + ' t/s';
+              }
+              sTokens.textContent = chunkCount + ' tok';
+            }
+            if (j.timings) {
+              const t = j.timings;
+              sPrefill.textContent = t.prefill_tps.toFixed(1) + ' t/s (' +
+                                     t.prefill_tokens + ' tok / ' + t.prefill_ms + ' ms)';
+              sGen.textContent = t.gen_tps.toFixed(1) + ' t/s (' +
+                                 t.completion_tokens + ' tok / ' + t.gen_ms + ' ms)';
+              sTtft.textContent = (t.ttft_ms == null ? '—' : t.ttft_ms + ' ms');
+              sTokens.textContent = t.completion_tokens + ' tok';
+              sTokens.title = t.max_tokens
+                ? ('本次生成上限 ' + t.max_tokens + ' token（按剩余上下文收窄）') : '';
+            }
+          } catch (e) { /* 忽略不完整/非 JSON 行 */ }
+        }
+      }
+    }
+    current.messages.push({ role:'assistant', content: answer, text: answer });
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      renderAnswer(textEl, answer + '\n\n*[已停止]*', true);
+    } else {
+      textEl.textContent = '请求失败：' + e.message;
+    }
+    mdFlush = false;                     // 已经自己渲染过了，别再被收尾覆盖
+    current.messages.push({ role:'assistant', content: answer || textEl.textContent,
+                            text: answer || textEl.textContent });
+  } finally {
+    if (mdFlush) renderAnswer(textEl, answer, true);   // 收尾刷一次，别留在节流里
+    clearWait();
+    refreshFiles();          // 这一轮可能写了新文件，让文件栏立刻出现（带删除按钮）
+    bubble.classList.remove('thinking');
+    controller = null;
+    stopBtn.disabled = true;
+    stopBtn.classList.add('hidden');
+    current.updatedAt = Date.now();
+    saveThreads();
+    renderThreads();
+    refreshFiles();
+    updateSendState();
+    inputEl.focus();
+  }
+}
+
+// ---------------------------------------------------------------- 交互绑定 --
+function openSidebar() {
+  sidebarEl.classList.add('open');
+  sidebarBackdrop.classList.remove('hidden');
+}
+function closeSidebar() {
+  sidebarEl.classList.remove('open');
+  sidebarBackdrop.classList.add('hidden');
+}
+
+sendBtn.onclick = send;
+stopBtn.onclick = () => { if (controller) controller.abort(); };
+clearBtn.onclick = () => {
+  if (!current) return;
+  current.messages = [];
+  current.title = '新对话';
+  saveThreads();
+  renderMessages();
+  renderThreads();
+  refreshFiles();
+  inputEl.focus();
+};
+newChatBtn.onclick = () => { newThread(true); inputEl.focus(); };
+menuBtn.onclick = () => {
+  if (sidebarEl.classList.contains('open')) closeSidebar(); else openSidebar();
+};
+sidebarBackdrop.onclick = closeSidebar;
+settingsBtn.onclick = () => {
+  const hidden = controlsEl.classList.toggle('hidden');
+  settingsBtn.textContent = hidden ? '设置' : '收起';
+};
+filesBtn.onclick = () => {
+  // 当前是显示的就收起、否则展开；filesVisible 只是「刷新时要不要自动显示」的偏好，
+  // 这样后台刷新（换会话、发完消息）不会把用户手动收起的文件栏又弹出来。
+  if (fileBar.classList.contains('show')) {
+    filesVisible = false;
+    fileBar.classList.remove('show');
+  } else {
+    filesVisible = true;
+    refreshFiles();
+  }
+};
+attachBtn.onclick = () => filesEl.click();
+filesEl.onchange = async () => {
+  await handleFiles([...filesEl.files]);
+  filesEl.value = '';
+};
+document.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) {
+    e.preventDefault();
+    handleFiles(files);
+  }
+});
+for (const ev of ['dragenter', 'dragover']) {
+  window.addEventListener(ev, (e) => {
+    e.preventDefault();
+    document.body.classList.add('dragging');
+  });
+}
+for (const ev of ['dragleave', 'drop']) {
+  window.addEventListener(ev, (e) => {
+    e.preventDefault();
+    if (ev === 'dragleave' && e.relatedTarget) return;
+    document.body.classList.remove('dragging');
+    if (ev === 'drop' && e.dataTransfer?.files?.length) {
+      handleFiles([...e.dataTransfer.files]);
+    }
+  });
+}
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+inputEl.addEventListener('input', updateSendState);
+
+// ---------------------------------------------------------------- 启动 --
+loadThreads();
+const savedCurrent = localStorage.getItem(LS_CURRENT);
+if (savedCurrent && threads.some(t => t.id === savedCurrent)) selectThread(savedCurrent);
+else if (threads.length) selectThread(threads[0].id);
+else newThread(true);
+renderThreads();
+renderAttachments();
+refreshFiles();
+inputEl.focus();
+</script>
+</body>
+</html>
