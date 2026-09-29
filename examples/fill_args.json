@@ -1,0 +1,19 @@
+[
+  {".name": "out", ".type_name": "float*", ".size": 8, ".offset": 0,
+   ".value_kind": "global_buffer", ".address_space": "global"},
+  {".name": "v", ".type_name": "float", ".size": 4, ".offset": 8, ".value_kind": "by_value"},
+  {".name": "n", ".type_name": "long long", ".size": 8, ".offset": 16, ".value_kind": "by_value"},
+  {".size": 4, ".offset": 24, ".value_kind": "hidden_block_count_x"},
+  {".size": 4, ".offset": 28, ".value_kind": "hidden_block_count_y"},
+  {".size": 4, ".offset": 32, ".value_kind": "hidden_block_count_z"},
+  {".size": 2, ".offset": 36, ".value_kind": "hidden_group_size_x"},
+  {".size": 2, ".offset": 38, ".value_kind": "hidden_group_size_y"},
+  {".size": 2, ".offset": 40, ".value_kind": "hidden_group_size_z"},
+  {".size": 2, ".offset": 42, ".value_kind": "hidden_remainder_x"},
+  {".size": 2, ".offset": 44, ".value_kind": "hidden_remainder_y"},
+  {".size": 2, ".offset": 46, ".value_kind": "hidden_remainder_z"},
+  {".size": 8, ".offset": 64, ".value_kind": "hidden_global_offset_x"},
+  {".size": 8, ".offset": 72, ".value_kind": "hidden_global_offset_y"},
+  {".size": 8, ".offset": 80, ".value_kind": "hidden_global_offset_z"},
+  {".size": 2, ".offset": 88, ".value_kind": "hidden_grid_dims"}
+]
