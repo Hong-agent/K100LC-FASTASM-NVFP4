@@ -1,0 +1,8 @@
+# 文本统一按 LF 存；二进制显式标记，免得 GitHub 当文本处理（diff/语言统计更准）
+* text=auto eol=lf
+
+*.hsaco      binary
+*.bin        binary
+prebuilt/rt  binary
+*.aio.run    binary
+*.tar.gz     binary
