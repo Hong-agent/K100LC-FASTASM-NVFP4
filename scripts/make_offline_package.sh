@@ -53,6 +53,7 @@ link() {
 
 echo "== [1/4] 复制应用（源码 + 驱动 + 运行时 + 预编译引擎）=="
 tar -C "$ROOT" -cf - \
+  --exclude=./.git \
   --exclude=./build \
   --exclude=./dist \
   --exclude=./workspaces \

@@ -30,6 +30,7 @@ mkdir -p "$STAGE/$NAME"
 
 echo "== 收集源码 → $STAGE/$NAME =="
 EXCLUDES=(
+  --exclude=./.git
   --exclude=./build
   --exclude=./dist
   --exclude=./workspaces

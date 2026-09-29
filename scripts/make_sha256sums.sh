@@ -13,6 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 find . \
+  -path ./.git -prune -o \
   -path ./build -prune -o \
   -path ./dist -prune -o \
   -path ./workspaces -prune -o \

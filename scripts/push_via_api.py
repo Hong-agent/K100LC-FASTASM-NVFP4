@@ -65,7 +65,9 @@ def main():
                     return json.loads(text) if text else {}
             except urllib.error.HTTPError as e:
                 text = e.read().decode()[:200]
-                if e.code < 500 and e.code != 429:
+                # 400/408/429 都当瞬时错误重试：这台机器到 GitHub 的长连接会被中间设备
+                # 掐断，GitHub 收到截断的 body 会回 400 "malformed request"。
+                if e.code not in (400, 408, 429) and e.code < 500:
                     sys.exit(f'HTTP {e.code} {method} {path}: {text}')
                 last = f'HTTP {e.code} {text}'
             except Exception as e:                                   # noqa: BLE001
