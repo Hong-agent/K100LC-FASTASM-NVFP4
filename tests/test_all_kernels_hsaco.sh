@@ -24,7 +24,10 @@ while read -r name; do
   count=$((count + 1))
 done < <(python3 -c 'import json,sys; print("\n".join(k["name"] for k in json.load(open(sys.argv[1]))))' "$TMP/all_kernels_spec.json")
 echo "resolved $count kernels"
-test "$count" -eq 80
+# 内核数随 spec 增长（NVFP4 GEMM 有原版 + 精确形状变体两个槽），这里要求
+# 「spec 里声明的每个内核都能被 HSA 解析」，而不是写死 80。
+n_spec="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$TMP/all_kernels_spec.json")"
+test "$count" -eq "$n_spec"
 
 scale_out="$(HSA_LOADER_PREFILL=2.0 HSA_LOADER_VALUE=3.0 HSA_LOADER_EXPECT=6.0 \
   "$TMP/hsa_min_loader" "$TMP/all.hsaco" _Z11scale_mul_kPffx 2>&1)"

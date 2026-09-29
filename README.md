@@ -15,8 +15,9 @@ NVFP4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网页�
 
 ## 一句话
 
-> 80 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于原 DTK 编译产物；
-> 打成一个 363,560 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
+> 80 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于原 DTK 编译产物
+> （NVFP4 GEMM 另有一个「精确形状」变体槽，共 81 个）；
+> 打成一个 371,896 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
 > **0**）；**全部 401 个线性层**都用 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
 > 原样（权重零误差），其余 233 个（注意力/线性注意力投影、lm_head、56~63 层 MLP）
 > 由 `tools/nvfp4_quant.py` 从 FP8 按同一规格重量化。
@@ -92,8 +93,8 @@ RP4=/path/to/model.rp4 bash scripts/setup_models.sh
 
 | 环节 | 结果 |
 |---|---|
-| 自研汇编器 | 80/80 个模型内核从 `.s` 汇编，**逐字节等于原 DTK 编译产物**（207,296 B） |
-| 自研 HSACO | 单文件 **363,560 B**，含 80 个内核；HSA 解析全部符号并执行 |
+| 自研汇编器 | 80/80 个模型内核从 `.s` 汇编，**逐字节等于原 DTK 编译产物**（207,296 B）+ 1 个手工变体（NVFP4 GEMM 精确形状槽） |
+| 自研 HSACO | 单文件 **371,896 B**，含 81 个内核；HSA 解析全部符号并执行 |
 | 运行时依赖 | `build/rt` 只链接 **libhsa-runtime64.so.1**；DTK 库引用 **0** |
 | 模型加载 | `.rp4` 单文件 **16.263 GB**，2001 张量（main 851 / NVFP4 802 / MTP+视觉 348） |
 | NVFP4 直跑 | **401 个线性层**走 NVFP4（其中 168 个 MLP 原样零误差，233 个由 FP8 重量化，实测相对 RMS ≈ 9.5%） |
@@ -107,7 +108,7 @@ RP4=/path/to/model.rp4 bash scripts/setup_models.sh
 | 路径 | 内容 |
 |---|---|
 | `asm.py`、`encodings.json` | **自研表驱动汇编器**与指令编码表（424+ 个编码形式） |
-| `kernels/asm/` | 80 个内核的 `.s` 源码（自研汇编器语法） |
+| `kernels/asm/` | 80 个内核的 `.s` 源码 + 1 个手工变体（自研汇编器语法） |
 | `kernels/kernel_spec.json` | 每个内核的参数表、kernarg/段大小、SGPR/VGPR 计数 |
 | `kernels/kv_pack.h` 等 | 内核共用常量与 RT4 内核头 |
 | `kernels/nvfp4/`、`include/nvfp4/` | **NVFP4** 解码 GEMV / GEMM 内核与 FP4→int8 原语 |

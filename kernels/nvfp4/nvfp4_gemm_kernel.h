@@ -159,3 +159,13 @@ inline void nvfp4_gemm_launch(const uint32_t* wp, const uint8_t* ws, const int8_
     dim3 grid((N + NVFP4_BN - 1) / NVFP4_BN, (M + NVFP4_BM - 1) / NVFP4_BM);
     nvfp4_gemm_kernel<<<grid, 256, 0, st>>>(wp, ws, ae, ao, asc, C, M, N, K, inv_gscale);
 }
+
+// 同一份算法的「精确形状」变体：M/N/K 都是分块整数倍时用，省掉 staging 里的
+// 边界谓词与掩码累积（见 docs/NVFP4-GEMM-ASM.md）。暂时与原内核逐字节相同，
+// 先把「第二个内核槽 + 运行时分派」这条链路打通并验证，再往里塞去守卫的 staging。
+inline void nvfp4_gemm_launch_ng(const uint32_t* wp, const uint8_t* ws, const int8_t* ae,
+                                 const int8_t* ao, const float* asc, float* C,
+                                 int M, int N, int K, float inv_gscale, hipStream_t st = 0) {
+    dim3 grid(N / NVFP4_BN, M / NVFP4_BM);
+    nvfp4_gemm_kernel_ng<<<grid, 256, 0, st>>>(wp, ws, ae, ao, asc, C, M, N, K, inv_gscale);
+}

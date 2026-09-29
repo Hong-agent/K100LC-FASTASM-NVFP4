@@ -3344,16 +3344,17 @@ static void engine_loop(Model& m) {
                 std::istringstream gs(arg);
                 gs >> gsteps >> gm;
             }
-            struct GBRow { const char* name; const Wq* w; bool x_is_gate; };
+            // x_sel: 0=d.xb(5120) 1=d.hout(6144) 2=d.m_gate(17408) —— 必须与 K 匹配，
+            // 否则内核按 K 的行距去读会把缓冲读穿（engine 模式 T_MAX 只有 512 行）。
+            struct GBRow { const char* name; const Wq* w; int x_sel; };
             const GBRow rows[] = {
-                {"q_proj      [12288x5120]", &m.layers[3].q_proj,     false},
-                {"k_proj      [1024x5120]",  &m.layers[3].k_proj,     false},
-                {"o_proj      [5120x6144]",  &m.layers[3].o_proj,     false},
-                {"in_proj_qkv [10240x5120]", &m.layers[0].in_qkv,     false},
-                {"out_proj    [5120x6144]",  &m.layers[0].out_proj,   false},
-                {"mlp.gate    [17408x5120]", &m.layers[0].mlp_gate,   false},
-                {"mlp.down    [5120x17408]", &m.layers[0].mlp_down,   true},
-                {"lm_head     [248320x5120]", &m.lm_head,             false},
+                {"q_proj      [12288x5120]", &m.layers[3].q_proj,     0},
+                {"k_proj      [1024x5120]",  &m.layers[3].k_proj,     0},
+                {"o_proj      [5120x6144]",  &m.layers[3].o_proj,     1},
+                {"in_proj_qkv [10240x5120]", &m.layers[0].in_qkv,     0},
+                {"out_proj    [5120x6144]",  &m.layers[0].out_proj,   1},
+                {"mlp.gate    [17408x5120]", &m.layers[0].mlp_gate,   0},
+                {"mlp.down    [5120x17408]", &m.layers[0].mlp_down,   2},
             };
             // 注意：M ≥ 1024 会触发内核/驱动侧的非法访问（模型里 CHUNK=512，用不到），
             // 这里只测 128/256/512 三档。
@@ -3366,13 +3367,17 @@ static void engine_loop(Model& m) {
                     const Wq& w = *r.w;
                     const char* only = getenv("RT_GB_ONLY");
                     if (only && !strstr(r.name, only)) continue;
-                    const float* x = r.x_is_gate ? m.d.m_gate : m.d.xb;
+                    const float* x = r.x_sel == 2 ? m.d.m_gate : r.x_sel == 1 ? m.d.hout : m.d.xb;
                     float* y = m.d.m_gate;            // [4096][17408]，够大
-                    // 输出/输入都要落在已有缓冲里（M*N、M*K）
-                    if ((long long)M * w.N > (long long)4096 * 17408) continue;
-                    if ((long long)M * w.K > (long long)4096 * 17408) continue;
+                    // 输出/输入都要落在已有缓冲里（按 engine 模式的 T_MAX 算）
+                    const int TM = m.T_MAX;
+                    if (M > TM) continue;
+                    if ((long long)M * w.N > (long long)TM * 17408) continue;
+                    if ((long long)M * w.K > (long long)TM * 17408) continue;
                     printf("  [gb] M=%d %s N=%d K=%d %s\n", M, r.name, w.N, w.K,
                            w.has_nvfp4() ? "NVFP4" : "int4");
+                    printf("       x=%p y=%p nvp=%p nvs=%p\n", (const void*)x, (void*)y,
+                           (const void*)w.nvp, (const void*)w.nvs);
                     fflush(stdout);
                     m.linear(y, w, x, M);             // 预热（含激活量化缓冲扩容）
                     CK(hipDeviceSynchronize());

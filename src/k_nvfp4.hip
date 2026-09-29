@@ -64,7 +64,15 @@ void k_nvfp4_gemm(float* y, const void* wp, const void* ws, float inv_gscale,
     if ((K / 16) % 2) { printf("k_nvfp4_gemm: K/16 不是偶数\n"); exit(1); }
     ensure_act(M, K);
     quant_act16(x, M, K);
-    nvfp4_gemm_launch((const uint32_t*)wp, (const uint8_t*)ws, s_ae, s_ao, s_as,
-                      y, M, N, K, inv_gscale);
+    // 形状正好是分块整数倍时走「精确形状」变体（省掉 staging 的边界谓词）。
+    // 目前它与原内核逐字节相同，这条分派先打通链路；去守卫的 staging 随后换进去。
+    static const bool ng = !(getenv("RT_GEMM_NG") && atoi(getenv("RT_GEMM_NG")) == 0);
+    if (ng && M % NVFP4_BM == 0 && N % NVFP4_BN == 0) {
+        nvfp4_gemm_launch_ng((const uint32_t*)wp, (const uint8_t*)ws, s_ae, s_ao, s_as,
+                             y, M, N, K, inv_gscale);
+    } else {
+        nvfp4_gemm_launch((const uint32_t*)wp, (const uint8_t*)ws, s_ae, s_ao, s_as,
+                          y, M, N, K, inv_gscale);
+    }
     if (hipGetLastError() != hipSuccess) { printf("nvfp4 gemm launch fail\n"); exit(1); }
 }
