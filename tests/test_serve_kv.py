@@ -39,7 +39,7 @@ def post(path, body, timeout=600):
 
 
 def chat(messages, conv=CONV, mt=48):
-    body = {'model': 'qwen38-fastasm-nvfp4', 'messages': messages, 'max_tokens': mt,
+    body = {'model': 'qwen38-fastasm-int4', 'messages': messages, 'max_tokens': mt,
             'temperature': 0, 'stream': True, 'skills': True, 'conversation_id': conv,
             'reasoning_effort': 'low'}
     content, tim = '', None
@@ -66,7 +66,7 @@ def main() -> int:
     if not (ROOT / 'build' / 'rt').exists() and not (ROOT / 'prebuilt' / 'rt').exists():
         print('跳过：还没有引擎（先跑 bash build.sh）')
         return 0
-    if not (ROOT / 'models/Qwen3.8-27B-NVFP4').exists():
+    if not (ROOT / 'models/Qwen3.8-27B-INT4').exists():
         print('跳过：还没有接权重（先跑 bash scripts/setup_models.sh）')
         return 0
     PORT = int(os.environ.get('RT_TEST_PORT') or free_port())

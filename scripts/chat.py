@@ -53,10 +53,10 @@ class Engine:
 
     def __init__(self, model=None, json=None, cmd=None, log=None, ctx=None, mtp_n=None,
                  no_mtp=False, env_extra=None, stderr=None):
-        model = model or os.environ.get('RT_RT4',
-                                        os.path.join(ROOT, 'models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4'))
-        json = json or os.environ.get('RT_RT4_JSON',
-                                      os.path.join(ROOT, 'models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4.json'))
+        # 默认模型目录是 int4（models/Qwen3.8-27B-INT4），RT_MODEL_DIR / RT_RT4 可覆盖。
+        _dir = os.environ.get('RT_MODEL_DIR', os.path.join(ROOT, 'models/Qwen3.8-27B-INT4'))
+        model = model or os.environ.get('RT_RT4', os.path.join(_dir, 'rt4/qwen38_27b.rt4'))
+        json = json or os.environ.get('RT_RT4_JSON', os.path.join(_dir, 'rt4/qwen38_27b.rt4.json'))
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
@@ -139,7 +139,7 @@ class Engine:
         except (OSError, ValueError):
             pass
 
-    def gen_stream(self, n, temp=0.0, top_p=1.0, top_k=0, seed=1234, stops=EOS):
+    def gen_stream(self, n, temp=0.95, top_p=0.95, top_k=40, seed=1234, stops=EOS):
         """发起一次生成，返回可逐行消费的 GenStream（用于流式转发）。
 
         读操作固定在一个「每请求专属」的线程里：客户端中途断开时 asyncio 取消的是
@@ -195,7 +195,7 @@ class Engine:
                 self.mtp_n = int(k)
             return st
 
-    def gen(self, n, temp=0.0, top_p=1.0, top_k=0, seed=1234, stops=EOS):
+    def gen(self, n, temp=0.95, top_p=0.95, top_k=40, seed=1234, stops=EOS):
         with self.lock:
             self.cmd(f'GEN {n} {temp} {top_p} {top_k} {seed} ' + ','.join(str(s) for s in stops))
             ids = []
@@ -226,9 +226,10 @@ def main():
     ap.add_argument('--ids')
     ap.add_argument('--system')
     ap.add_argument('--n', type=int, default=64)
-    ap.add_argument('--temp', type=float, default=0.0)
-    ap.add_argument('--top-p', type=float, default=1.0)
-    ap.add_argument('--top-k', type=int, default=0)
+    # 采样默认（用户指定）：温度 0.95 / top-p 0.95 / top-k 40；要贪心就 --temp 0
+    ap.add_argument('--temp', type=float, default=0.95)
+    ap.add_argument('--top-p', type=float, default=0.95)
+    ap.add_argument('--top-k', type=int, default=40)
     ap.add_argument('--seed', type=int, default=1234)
     ap.add_argument('--raw', action='store_true', help='prompt 不当 chat 处理，直接编码')
     ap.add_argument('--dump-layers')

@@ -25,7 +25,7 @@ sudo reboot
 
 cd ..                          # 回项目根目录
 bash build.sh
-bash serve.sh                  # http://<本机IP>:8080/
+bash serve.sh                  # http://<本机IP>/（默认 80；PORT=8080 可换）
 ```
 
 ## 本目录内容

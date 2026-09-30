@@ -11,7 +11,7 @@ import sys
 
 MODEL_DIR = os.environ.get('RT_MODEL_DIR',
                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        '..', 'models', 'Qwen3.8-27B-NVFP4'))
+                                        '..', 'models', 'Qwen3.8-27B-INT4'))
 
 from tokenizers import Tokenizer                                    # noqa: E402
 

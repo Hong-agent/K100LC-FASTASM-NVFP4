@@ -1,5 +1,10 @@
 # nvfp4_gemm_kernel 的机器码地图（手工改汇编用）
 
+> **状态（2026-09-30）：NVFP4 直跑已降级为备用选项**，默认模型走 RT4 int4（W4A8）。
+> 原因见 [BENCHLOG.md](BENCHLOG.md)：全部线性层 NVFP4 时预填充 −14.9%、GEMV −17%、
+> `.rp4` +3.2%，且本内核在 M ≥ 1024 有已知非法地址访问。本文档保留下来，是给
+> 「要把这条路优化回来」的人看的地图与优化清单。
+
 内核机器码来自 `kernels/asm/k_nvfp4/002__Z17nvfp4_gemm_kernelPKjPKhPKaS4_PKfPfiiif.s`
 （1055 行 ≈ 1054 条指令，5976 字节）；它由 DTK 编译产物反汇编而来，本项目**没有 GPU
 编译器**，所以任何改动都得手工写 `.s`（自研汇编器 `asm.py` + `encodings.json` 支持
@@ -103,8 +108,8 @@ int4 的精度），与「和 MLP 规格一致」冲突。
 1. `python3 -c "import asm; asm.assemble(...)"` —— 汇编通过；
 2. `bash build.sh` —— 进 HSACO；
 3. `NVCHK <层>` —— 与 `tools/nvfp4_ref.py` 的参考实现逐元素对拍（现在一致到 1e-7）；
-4. `GEMMBENCH 20 512` —— 与 `model.rp4.int4only` 的同形状读数对比（现在 NVFP4 9.8
-   vs int4 W4A8 17.4 TMAC/s）；
+4. `GEMMBENCH 20 512` —— 同形状读数对比（NVFP4 单遍 9.8 vs int4 W4A8 两遍
+   17.4 TMAC/s；默认打包就是 W4A8，不用再切 `.rp4`）；
 5. `bash tests/run_all.sh` —— 20 项全过。
 
 ## 5. 已知限制

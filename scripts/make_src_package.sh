@@ -9,7 +9,7 @@
 # （**不限内核版**，装驱动要用）、以及联网部署脚本 scripts/deploy_online.sh 与
 # scripts/fetch_model.sh。
 #
-# 包里没有（目标机联网自己取）：权重（models/*，~22.5GB）、备好的 RT4/RP4 产物、
+# 包里没有（目标机联网自己取）：权重（models/*，~18.6GB）、备好的 RT4/RP4 产物、
 # 编译产物 build/、自带的 Python 运行库 runtime/py、runtime/python、
 # 会话工作区 workspaces/、离线权重包 dist/。
 #
@@ -36,6 +36,7 @@ EXCLUDES=(
   --exclude=./workspaces
   --exclude=./runtime/py
   --exclude=./runtime/python
+  --exclude=./models/Qwen3.8-27B-INT4
   --exclude=./models/Qwen3.8-27B-NVFP4
   --exclude=./driver/hyhal
   --exclude='*/__pycache__'

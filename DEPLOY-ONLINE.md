@@ -11,8 +11,8 @@
 | 系统 | Ubuntu 22.04（22.04.5 实测） | 自带 |
 | 编译器/工具 | `g++ gcc make cmake autoconf m4 curl python3` | `apt install` |
 | DCU 驱动 | 包内 `driver/installer/rock-*-any-kernel.aio.run` | 本包 |
-| 源模型 | `unsloth/Qwen3.8-27B-NVFP4`（22.57 GB + 0.85 GB） | `scripts/fetch_model.sh` 从魔搭拉 |
-| 磁盘 | 源权重 23.4 GB + 转换产物 15.2 GB + 单文件 15.8 GB ≈ **55 GB** | 本地 |
+| 源模型 | `RedHatAI/Qwen3.8-27B-INT4`（18.60 GB + 0.85 GB，**默认 int4**） | `scripts/fetch_model.sh` 从魔搭拉 |
+| 磁盘 | 源权重 19.5 GB + 转换产物 15.5 GB + 单文件 14.4 GB ≈ **50 GB** | 本地 |
 
 ## 1. 装系统依赖
 
@@ -49,10 +49,10 @@ bash scripts/deploy_online.sh          # 环境检查 → 装依赖 → 下模�
 分步等价于：
 
 ```bash
-bash scripts/fetch_model.sh            # 下源权重（16 连接断点续传，~22.6 GB）
-bash scripts/setup_models.sh           # 把权重接进 models/Qwen3.8-27B-NVFP4/
+bash scripts/fetch_model.sh            # 下源权重（16 连接断点续传，默认 int4 ~18.6 GB）
+bash scripts/setup_models.sh           # 把权重接进 models/Qwen3.8-27B-INT4/
 bash scripts/convert_weights.sh        # 转成 RT4（主机 gcc，约 4.5 分钟）
-bash scripts/pack_weights.sh           # 合成单文件 model.rp4（约 15.8 GB，几分钟）
+bash scripts/pack_weights.sh           # 合成单文件 build/model-int4.rp4（约 14.4 GB，几分钟）
 bash build.sh                          # 自研汇编器汇编 80 内核 → HSACO → g++ 编出 build/rt
 ```
 
@@ -61,7 +61,7 @@ bash build.sh                          # 自研汇编器汇编 80 内核 → HSA
 ## 4. 跑起来
 
 ```bash
-bash serve.sh                    # 网页 http://<本机IP>:8080/ + OpenAI 兼容接口
+bash serve.sh                    # 网页 http://<本机IP>/（默认监听 80）+ OpenAI 兼容接口
 bash serve.sh --stop
 bash run.sh --prompt "你好" --n 64
 ```
@@ -73,7 +73,7 @@ bash run.sh --prompt "你好" --n 64
 验证接口：
 
 ```bash
-curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+curl -s localhost/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"1+1=?"}],"max_tokens":16}'
 ```
 
@@ -81,10 +81,14 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 源码包里带了预编译引擎（`prebuilt/rt` + `prebuilt/k100lc_all.hsaco`），
 跑 `run.sh` / `serve.sh` 时会自动用它；**只有改内核/改运行时才需要 `build.sh`**。
-权重仍然要按第 3 步准备（源模型 → RT4 → model.rp4）。
+权重仍然要按第 3 步准备（源模型 → RT4 → `build/model-int4.rp4`）。
 
 如果连转换也不想在目标机做，可以直接用离线整包
-`K100LC-FASTASM-NVFP4-离线部署-<日期>.zip`（里面已经带了 `model.rp4`）。
+`K100LC-FASTASM-NVFP4-离线部署-<日期>.zip`（里面已经带了 int4 的 `model.rp4`）。
+
+想改成上游 NVFP4 checkpoint 那条路线：`VARIANT=nvfp4 bash scripts/fetch_model.sh`，
+再按第 3 步转换/打包（打包时加 `RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RP4=build/model.rp4`），
+运行时 `RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh`。
 
 ## 6. 常见问题
 
@@ -92,6 +96,7 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 |---|---|
 | `build.sh` 报缺 `/opt/hyhal` | 驱动没装：回第 2 步 |
 | `fetch_model.sh` 下载很慢 | 换源：`SOURCE=hf bash scripts/fetch_model.sh`（HF 直连可能被 302） |
+| `fetch_model.sh` 报 int4 仓库里没有 `model_mtp.safetensors` | 正常：MTP 头会自动改从 `unsloth/Qwen3.8-27B-NVFP4` 取（两份逐字节相同，sha256 一致） |
 | `convert_weights.sh` 报缺 `qwen38_27b_vision.rt4.json` | 视觉塔转换要走 `tools/convert_vision_rt4.py`，需要 `numpy`：`pip install numpy` |
 | 网页起来但回答不出 | `tail -f build/serve.log`；第一次请求会与权重后台加载重叠，稍等即可 |
 | 想确认内核机器码没变 | `bash build.sh --check`（与参考逐字节比对 + HSA 加载检查） |

@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import tok as T                                              # noqa: E402
 
 ENGINE = os.environ.get('RT_ENGINE_BIN') or str(ROOT / 'build' / 'rt')
-MODEL = os.environ.get('RT_RT4') or str(ROOT / 'models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4')
+MODEL = os.environ.get('RT_RT4') or str(ROOT / 'models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4')
 CTX = os.environ.get('RT_TEST_CTX', '8192')
 
 FILLER = ('这是一段用来把上下文撑长的背景资料，正文内容不重要，'

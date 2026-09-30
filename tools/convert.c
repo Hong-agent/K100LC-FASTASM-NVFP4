@@ -280,8 +280,10 @@ static void convert_linear(const char *name, const tensor_t *wt, int bits,
     int64_t N = wt->shape[0], K = wt->shape[1];
     int is_fp8 = !strcmp(wt->dtype, "F8_E4M3");
     int is_pack = !strcmp(wt->dtype, "U8");
+    int is_i32 = !strcmp(wt->dtype, "I32");
     int is_bf16 = !strcmp(wt->dtype, "BF16");
     if (is_pack) K *= 2;               /* U8 里一行是 K/2 字节（每字节 2 个 int4） */
+    else if (is_i32) K *= 8;           /* I32 里一行是 K/8 个字（每字 8 个 int4） */
     tensor_t logical = *wt;
     logical.shape[1] = K;
 
@@ -313,6 +315,21 @@ static void convert_linear(const char *name, const tensor_t *wt, int bits,
                     int c = (i & 1) ? (codes[i >> 1] >> 4) : (codes[i >> 1] & 0xF);
                     float blk = f8_lut[bsrow[i >> 4]];
                     dst[i] = e2m1_lut[c] * blk / gscale;
+                }
+            } else if (is_i32) {
+                /* compressed-tensors `pack-quantized` int4（RedHatAI/Qwen3.8-27B-INT4）：
+                   weight_packed I32 [N, K/8]，8 个 4bit 码一个字（低半字节 = 前一个 k，
+                   依次 4a 位），码是 **offset-binary**（值 = 码 - 8，range [-8,7]）；
+                   weight_scale BF16 [N, K/128]，每 128 个 k 一个尺度，**没有 global scale**。
+                   已用同底座的 unsloth/Qwen3.8-27B-NVFP4 做对照：按此式反量化后，
+                   形状相关 0.97~0.98（差值来自本 checkpoint 自带的 AWQ 平滑），
+                   且码直方图峰值落在 8 上 —— 进一步确认是 offset-binary 而不是二补码。 */
+                const uint32_t *codes = (const uint32_t *)(g_data + wt->off + n * (K / 8) * 4);
+                const uint16_t *srow  = (const uint16_t *)(g_data + bs->off + n * (K / GRP) * 2);
+                for (int64_t i = 0; i < K; i++) {
+                    uint32_t w = codes[i >> 3];
+                    int c = (int)((w >> ((i & 7) * 4)) & 0xF) - 8;
+                    dst[i] = (float)c * bf16_to_f32(srow[i >> 7]);
                 }
             } else if (is_fp8) {
                 const uint8_t *codes = g_data + wt->off + n * K;
@@ -494,23 +511,32 @@ int main(int argc, char **argv) {
             if (g_skip_visual && starts_with(t->name, "model.visual.")) { t->used = 1; continue; }
             /* 伴侣张量（尺度/全局尺度）不单独输出，随父张量处理 */
             if (ends_with(t->name, ".weight_scale") || ends_with(t->name, "_global_scale") ||
-                ends_with(t->name, ".k_scale") || ends_with(t->name, ".v_scale")) continue;
+                ends_with(t->name, ".k_scale") || ends_with(t->name, ".v_scale") ||
+                ends_with(t->name, ".weight_shape")) continue;
 
             char par[256];
             if (ends_with(t->name, ".weight_packed")) {
-                /* NVFP4 MLP：找 weight_scale / weight_global_scale */
+                /* 两种 pack-quantized：
+                   U8  = NVFP4（weight_scale fp8 块尺度 + weight_global_scale）
+                   I32 = int4（weight_scale bf16，每 128 k 一个，无 global scale） */
+                int is_i32 = !strcmp(t->dtype, "I32");
                 /* 注意：截掉结尾的 "weight_packed"（保留前面那个点），不能用 %.*s 取前 N 个字符 */
                 int keep = (int)(strlen(t->name) - strlen("weight_packed"));
                 snprintf(par, sizeof(par), "%.*sweight_scale", keep, t->name);
                 int si = find_tensor(par);
-                snprintf(par, sizeof(par), "%.*sweight_global_scale", keep, t->name);
-                int gi = find_tensor(par);
-                if (si < 0 || gi < 0) { fprintf(stderr, "缺少伴侣: %s (si=%d gi=%d)\n", t->name, si, gi); continue; }
+                int gi = -1;
+                if (!is_i32) {
+                    snprintf(par, sizeof(par), "%.*sweight_global_scale", keep, t->name);
+                    gi = find_tensor(par);
+                }
+                if (si < 0 || (!is_i32 && gi < 0)) {
+                    fprintf(stderr, "缺少伴侣: %s (si=%d gi=%d)\n", t->name, si, gi); continue; }
                 /* 输出名去掉 .weight_packed 后缀，统一成 ...weight */
                 char final[192];
                 snprintf(final, sizeof(final), "%.*sweight", keep, t->name);
-                convert_linear(final, t, 4, &g_t[si], &g_t[gi], NULL);
+                convert_linear(final, t, 4, &g_t[si], is_i32 ? NULL : &g_t[gi], NULL);
                 t->used = 1; g_t[si].used = 1;
+                if (gi >= 0) g_t[gi].used = 1;
             } else if (!strcmp(t->dtype, "F8_E4M3") && t->ndim == 2) {
                 snprintf(par, sizeof(par), "%s_scale", t->name);
                 int si = find_tensor(par);

@@ -1,6 +1,7 @@
 # RT4 运行格式与自研框架设计（K100_LC / gfx926）
 
-目标模型：**`unsloth/Qwen3.8-27B-NVFP4`**（镜像自魔搭官方同名仓库，落在 `models/Qwen3.8-27B-NVFP4/`）。
+目标模型：**`RedHatAI/Qwen3.8-27B-INT4`**（落在 `models/Qwen3.8-27B-INT4/`，全项目默认；
+上游 NVFP4 checkpoint `unsloth/Qwen3.8-27B-NVFP4` 落在 `models/Qwen3.8-27B-NVFP4/`，opt-in）。
 硬指标（用户指定）：**128k 上下文；填充 1000 token；开 MTP3；输出 100 token**，
 即验收跑法等价于 `llama-bench -d 131072 -p 1000 -n 100` 再加 MTP 3 草稿，
 两个吞吐指标分别按 1000 t/s（预填充）与 100 t/s（吐字）考核。

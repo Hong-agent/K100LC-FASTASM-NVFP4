@@ -2,7 +2,7 @@
 # OpenAI 兼容 HTTP 服务：把自研运行时（build/rt --engine）包成 /v1/chat/completions。
 # 接口形态与常见 OpenAI 客户端一致，客户端不用改。
 #
-#   python3 scripts/serve.py --port 8080 [--ctx 131072] [--default-max-tokens 40960]
+#   python3 scripts/serve.py --port 80 [--ctx 131072] [--default-max-tokens 40960]
 #
 # 依赖（DTK 镜像里都有）：fastapi / uvicorn / tokenizers / jinja2。
 import argparse
@@ -48,6 +48,10 @@ MAX_EXTRACT_CHARS = int(os.environ.get('RT_MAX_EXTRACT_CHARS', '40000'))
 CTX_LIMIT = int(os.environ.get('RT_CTX', '131072'))
 # 请求体不带 max_tokens 时用它；main() 会用 --default-max-tokens 覆盖
 DEFAULT_MAX_TOKENS = int(os.environ.get('RT_DEFAULT_MAX_TOKENS', '40960'))
+# 采样默认值（用户指定）：请求里不带 temperature/top_p/top_k 时用这三个。
+DEFAULT_TEMP = float(os.environ.get('RT_DEFAULT_TEMP', '0.95'))
+DEFAULT_TOP_P = float(os.environ.get('RT_DEFAULT_TOP_P', '0.95'))
+DEFAULT_TOP_K = int(os.environ.get('RT_DEFAULT_TOP_K', '40'))
 
 # 可选的外部视觉桥：当前 RT4 运行时只加载文本塔，model.visual.* 在转换时跳过。
 # 配好一个 OpenAI 兼容的视觉模型后，服务端会先把图片转成文字描述，再交给 RT4；
@@ -265,6 +269,17 @@ def split_thinking(text, enabled=True):
     return reasoning, answer
 
 
+def _safe_detok_prefix(s):
+    """增量 detokenize 的保底：压住末尾还没解码完整的半个字符。
+
+    HuggingFace tokenizers 对「字节还没凑齐」的前缀会解码出 U+FFFD，逐 token
+    流式转发时那个替换字符就直达网页（看到的「乱码」）。这里把末尾的 U+FFFD
+    先扣住不发，等下一个 token 把字符补全再发；真的非法字节也只是晚一轮出现
+    （下一个 token 到达后 cur 不再以 U+FFFD 结尾，照样会补发）。
+    """
+    return s[:-1] if s.endswith('\ufffd') else s
+
+
 class ThinkSplitter:
     """流式增量 detokenize 的切分器：把「思考」与「正式回答」分成两股逐段产出。
 
@@ -282,6 +297,7 @@ class ThinkSplitter:
 
     def feed(self, cur):
         """返回 [(field, text), ...]，field 是 'reasoning' 或 'content'。"""
+        cur = _safe_detok_prefix(cur)
         out = []
         if not self.think:
             if len(cur) > self.sent_content:
@@ -552,7 +568,7 @@ def extract_document(name, data):
 
 def _vision_local_file():
     return VISION_RT4 or os.path.join(
-        os.environ.get('RT_MODEL_DIR', os.path.join(ROOT, 'models', 'Qwen3.8-27B-NVFP4')),
+        os.environ.get('RT_MODEL_DIR', os.path.join(ROOT, 'models', 'Qwen3.8-27B-INT4')),
         'rt4', 'qwen38_27b_vision.rt4')
 
 
@@ -566,7 +582,7 @@ def _rp4_ready():
     if os.environ.get('RT_RP4') == '0' or os.environ.get('RT_NVFP4') == '0':
         return False
     p = os.environ.get('RT_RP4') or os.path.join(
-        os.environ.get('RT_MODEL_DIR', os.path.join(ROOT, 'models', 'Qwen3.8-27B-NVFP4')),
+        os.environ.get('RT_MODEL_DIR', os.path.join(ROOT, 'models', 'Qwen3.8-27B-INT4')),
         'model.rp4')
     return os.path.exists(p)
 
@@ -785,11 +801,13 @@ def build_ids(body):
 
 
 def sampling(body):
+    # 默认 0.95 / 0.95 / 40（RT_DEFAULT_* 环境变量可改）；显式传 0 就是贪心，不受影响。
     temp = body.get('temperature')
-    temp = 0.0 if temp is None else float(temp)
+    temp = DEFAULT_TEMP if temp is None else float(temp)
     top_p = body.get('top_p')
-    top_p = 1.0 if top_p is None else float(top_p)
-    top_k = int(body.get('top_k') or 0)
+    top_p = DEFAULT_TOP_P if top_p is None else float(top_p)
+    raw_k = body.get('top_k')
+    top_k = DEFAULT_TOP_K if raw_k is None else int(raw_k)
     # max_tokens：客户端没给就用 --default-max-tokens（默认 40960，即「生成到 EOS
     # 或者把上下文用满」）。显式给值也只是上限，装不下时按剩余上下文收窄
     # （见 clamp_max_tokens）；只有 prompt 本身就超出上下文才报 413。
@@ -878,6 +896,9 @@ def capabilities():
         'document_extract': True,
         'context': CTX_LIMIT,                 # KV cache 容量（token）
         'max_tokens': DEFAULT_MAX_TOKENS,     # 请求不带 max_tokens 时的生成上限
+        'temperature': DEFAULT_TEMP,          # 请求不带采样参数时的默认值
+        'top_p': DEFAULT_TOP_P,
+        'top_k': DEFAULT_TOP_K,
         'max_upload_mb': MAX_UPLOAD_MB,
         'max_extract_chars': MAX_EXTRACT_CHARS,
         'formats': ['txt', 'md', 'json', 'csv', 'html', 'xml', 'pdf', 'docx',
@@ -1400,7 +1421,9 @@ async def _complete(body: dict):
                             acc.append(tok)
                             if ttft is None:
                                 ttft = time.time()
-                            cur = T.decode(acc)
+                            # 末尾半个字符先不发（见 _safe_detok_prefix），否则网页上
+                            # 会看到 U+FFFD 乱码，收尾时还要整段重发一次。
+                            cur = _safe_detok_prefix(T.decode(acc))
                             if not think:
                                 # 关闭思考：全部是正式回答
                                 if len(cur) > len(prev):
@@ -1724,7 +1747,7 @@ def _sse(rid, created, delta, finish=None, model=None, extra=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--port', type=int, default=8080)
+    ap.add_argument('--port', type=int, default=80)
     ap.add_argument('--host', default='0.0.0.0')
     # serve.sh 一直传 --ctx，但这里以前没定义 → argparse 报错、容器反复重启
     ap.add_argument('--ctx', type=int, default=131072, help='KV cache 容量（token）')

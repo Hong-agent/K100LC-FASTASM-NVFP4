@@ -1,9 +1,13 @@
 #!/bin/bash
 # 启动网页控制台 + OpenAI 兼容接口（网页来自 K100LC-RT4/web，后端是本项目的 build/rt）。
+# **默认模型 = Qwen3.8-27B-INT4**（models/Qwen3.8-27B-INT4，单文件 build/model-int4.rp4）。
 #
-#   bash serve.sh                         # 默认 http://<本机IP>:8080/
-#   PORT=80 CTX=40960 MTP_N=0 bash serve.sh
+#   bash serve.sh                         # 默认 http://<本机IP>/（监听 80，不带端口号）
+#   PORT=8080 CTX=40960 MTP_N=0 bash serve.sh
 #   bash serve.sh --stop
+#
+# 换成 NVFP4 checkpoint（opt-in）：
+#   RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh
 #
 # 前端引擎是 build/rt：自研汇编器产出的 HSACO + /opt/hyhal 的 HSA 直跑，
 # 不经过 DTK，也不经过 Docker。
@@ -12,7 +16,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/scripts/env.sh"
 cd "$RT_ROOT"
 
-PORT="${PORT:-8080}"
+# 默认监听 80，这样局域网里直接访问 http://<本机IP>/ 就行（不用带端口号）。
+PORT="${PORT:-80}"
 CTX="${CTX:-40960}"
 MTP_N="${MTP_N:-3}"
 PIDFILE="$RT_ROOT/build/serve.pid"
@@ -21,8 +26,18 @@ NO_MTP_FLAG=""
 [ "${NO_MTP:-0}" != "0" ] && NO_MTP_FLAG="--no-mtp"
 
 export RT_ENGINE_BIN="${RT_ENGINE_BIN:-$RT_ROOT/build/rt}"
-export RT_SERVED_NAME="${RT_SERVED_NAME:-qwen38-fastasm-nvfp4}"
-export RT_VISION_DEVICE="${RT_VISION_DEVICE:-gpu}"
+export RT_SERVED_NAME="${RT_SERVED_NAME:-qwen38-fastasm-int4}"
+# RT_VISION_DEVICE 默认 gpu，由 scripts/env.sh 设置（视觉塔不进 .rp4，从 RT_VISION_RT4 单独加载）
+
+# 80 是特权端口：非 root 时要么给解释器一次性加能力，要么退回高位端口。
+if [ "$PORT" -lt 1024 ] && [ "$(id -u)" != 0 ] && command -v getcap >/dev/null 2>&1; then
+  if ! getcap "$RT_PYTHON" 2>/dev/null | grep -q cap_net_bind_service; then
+    echo "端口 $PORT 是特权端口，而 $RT_PYTHON 没有 cap_net_bind_service。" >&2
+    echo "  一次性授权： sudo setcap 'cap_net_bind_service=+ep' $RT_PYTHON" >&2
+    echo "  或改用高位端口： PORT=8080 bash serve.sh" >&2
+    exit 1
+  fi
+fi
 
 if [ "${1:-}" = "--stop" ]; then
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -44,6 +59,11 @@ fi
 if [ ! -r "$RT_MODEL_DIR/tokenizer.json" ]; then
   echo "缺少 tokenizer：$RT_MODEL_DIR/tokenizer.json" >&2
   echo "先跑：bash scripts/setup_models.sh" >&2
+  exit 1
+fi
+if [ ! -r "$RT_RP4" ]; then
+  echo "缺少权重 $RT_RP4" >&2
+  echo "  默认模型是 int4：先跑 bash scripts/convert_weights.sh && bash scripts/pack_weights.sh" >&2
   exit 1
 fi
 
@@ -95,8 +115,9 @@ if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null || \
 fi
 
 LAN_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^172\.17\.' | head -1)"
+PORT_SUFFIX=":$PORT"; [ "$PORT" = "80" ] && PORT_SUFFIX=""
 echo "网页控制台已启动（引擎 $RT_ENGINE_BIN）"
-echo "  网页 : http://${LAN_IP:-127.0.0.1}:$PORT/"
-echo "  接口 : http://${LAN_IP:-127.0.0.1}:$PORT/v1"
+echo "  网页 : http://${LAN_IP:-127.0.0.1}${PORT_SUFFIX}/"
+echo "  接口 : http://${LAN_IP:-127.0.0.1}${PORT_SUFFIX}/v1"
 echo "  日志 : tail -f $LOGFILE"
 echo "  停止 : bash serve.sh --stop"

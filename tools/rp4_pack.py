@@ -6,19 +6,20 @@
 
     读头 -> 读索引 -> 从头到尾顺序读载荷（O_DIRECT）-> 完
 
-主模型里被 NVFP4 取代的张量在打包时整段丢掉（既省空间也省 I/O）：168 个 MLP 是
-checkpoint 原生 NVFP4；注意力 / 线性注意力投影、lm_head、第 56~63 层 MLP 由
-tools/nvfp4_quant.py 从 FP8 按同一规格重量化（--nvfp4-extra）。
-MTP 头（`mtp.`）和视觉塔（`model.visual.`）也一起装进来，运行时不再需要
-任何别的权重文件。
+主模型默认**保持 RT4 的 int4 权重（W4A8）**，一个张量都不替换。想让某些线性层
+改走 NVFP4 直跑，才给 `--nvfp4/--nvfp4-tsv`（168 个 MLP 是 checkpoint 原生
+NVFP4）以及可选的 `--nvfp4-extra`（注意力 / 线性注意力投影、lm_head、第 56~63 层
+MLP，由 tools/nvfp4_quant.py 从 FP8 按同一规格重量化）——那时被取代的张量在载荷里
+整段丢掉。
+
+MTP 头（`mtp.`）总是装进来；视觉塔（`model.visual.`）是**可选**的，不给
+`--vision/--vision-json` 就不装（图片走 scripts/vision_cpu.py 的 CPU 编码器）。
 
     python3 tools/rp4_pack.py \\
         --main  <qwen38_27b.rt4>        --main-json  <qwen38_27b.rt4.json> \\
         --mtp   <qwen38_27b_mtp.rt4>    --mtp-json   <qwen38_27b_mtp.rt4.json> \\
-        --vision <qwen38_27b_vision.rt4> --vision-json <qwen38_27b_vision.rt4.json> \\
-        --nvfp4 <model.safetensors> --nvfp4-tsv <nvfp4_manifest.tsv> \\
-        --nvfp4-extra <nvfp4_extra_blob.bin> --nvfp4-extra-tsv <nvfp4_extra_manifest.tsv> \\
         --out <model.rp4>
+        # 可选：--vision/--vision-json、--nvfp4/--nvfp4-tsv、--nvfp4-extra/--nvfp4-extra-tsv
 """
 import argparse
 import json
@@ -60,11 +61,15 @@ def read_nvfp4_tsv(path, src='nv'):
 
 def main():
     ap = argparse.ArgumentParser()
-    for k in ('main', 'mtp', 'vision'):
+    for k in ('main', 'mtp'):
         ap.add_argument('--' + k, required=True)
         ap.add_argument('--%s-json' % k, required=True)
-    ap.add_argument('--nvfp4', required=True)
-    ap.add_argument('--nvfp4-tsv', required=True)
+    # 视觉塔可选：不给就不装进 .rp4（图片交给 CPU 编码器，见 docs/RP4-FORMAT.md）
+    ap.add_argument('--vision')
+    ap.add_argument('--vision-json')
+    # NVFP4 可选：不给就保持主模型的 RT4 int4 权重（W4A8），不做任何替换
+    ap.add_argument('--nvfp4')
+    ap.add_argument('--nvfp4-tsv')
     # 额外一份「从 FP8 重量化出来的 NVFP4」（tools/nvfp4_quant.py 的产物）：
     # 注意力/线性注意力投影、lm_head、第 56~63 层 MLP。载荷单独一个 blob。
     ap.add_argument('--nvfp4-extra')
@@ -72,7 +77,9 @@ def main():
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
 
-    nv = read_nvfp4_tsv(a.nvfp4_tsv, 'nv')
+    if bool(a.nvfp4) != bool(a.nvfp4_tsv):
+        sys.exit('--nvfp4 与 --nvfp4-tsv 必须一起给')
+    nv = read_nvfp4_tsv(a.nvfp4_tsv, 'nv') if a.nvfp4_tsv else []
     if a.nvfp4_extra:
         if not a.nvfp4_extra_tsv:
             sys.exit('--nvfp4-extra 需要同时给 --nvfp4-extra-tsv')
@@ -110,7 +117,10 @@ def main():
         items.append((g, 'nvs', 'main', r['stem'], 'nvfp4', r['N'], r['K'], 16,
                       r['src'], r['soff'], r['sbytes'], r['gscale'], 0))
 
-    for part, jpath, src in (('mtp', a.mtp_json, 'mtp'), ('visual', a.vision_json, 'vision')):
+    parts = [('mtp', a.mtp_json, 'mtp')]
+    if a.vision_json:
+        parts.append(('visual', a.vision_json, 'vision'))
+    for part, jpath, src in parts:
         grp = 67 if part == 'mtp' else 68
         for t in json.load(open(jpath))['tensors']:
             items.append((grp, 't', part, t['name'], t['kind'], t['shape'][0],
@@ -151,8 +161,11 @@ def main():
     print('  载荷 %.3f GB，索引 %d 行，文件共 %.3f GB'
           % (data_len / 1e9, len(lines) - 1, (data_off + data_len) / 1e9))
 
-    srcs = {'main': open(a.main, 'rb'), 'mtp': open(a.mtp, 'rb'),
-            'vision': open(a.vision, 'rb'), 'nv': open(a.nvfp4, 'rb')}
+    srcs = {'main': open(a.main, 'rb'), 'mtp': open(a.mtp, 'rb')}
+    if a.vision:
+        srcs['vision'] = open(a.vision, 'rb')
+    if a.nvfp4:
+        srcs['nv'] = open(a.nvfp4, 'rb')
     if a.nvfp4_extra:
         srcs['nve'] = open(a.nvfp4_extra, 'rb')
     t0 = time.time()

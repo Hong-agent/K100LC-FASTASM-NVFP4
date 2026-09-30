@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = os.environ.get("RT_ENGINE_BIN", str(ROOT / "build" / "rt"))
-MODEL = os.environ.get("RT_RT4", str(ROOT / "models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4"))
+MODEL = os.environ.get("RT_RT4", str(ROOT / "models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4"))
 PROMPT = [104177, 104110, 3837, 374]
 
 
@@ -53,7 +53,7 @@ def main() -> int:
     if not os.path.exists(ENGINE):
         print(f"跳过：没有引擎 {ENGINE}（先跑 bash build.sh）")
         return 0
-    rp4 = os.environ.get("RT_RP4") or str(ROOT / "models/Qwen3.8-27B-NVFP4/model.rp4")
+    rp4 = os.environ.get("RT_RP4") or str(ROOT / "models/Qwen3.8-27B-INT4/model.rp4")
     if not Path(MODEL).exists() and not Path(rp4).exists():
         print("跳过：没有接好权重（先跑 bash scripts/setup_models.sh）")
         return 0

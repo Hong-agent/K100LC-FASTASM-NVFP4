@@ -12,9 +12,9 @@
 # 每一步都能单独重跑（幂等）：
 #   驱动    见 driver/INSTALL.md（或 driver/installer/*.aio.run）
 #   依赖    python3 -m pip install -r requirements.txt
-#   模型    bash scripts/fetch_model.sh
+#   模型    bash scripts/fetch_model.sh      （默认 int4：RedHatAI/Qwen3.8-27B-INT4）
 #   转换    bash scripts/convert_weights.sh   （RT4 格式，主机 gcc，约 4.5 分钟）
-#   权重    bash scripts/pack_weights.sh      （合成单文件 model.rp4，约 15.8 GB）
+#   权重    bash scripts/pack_weights.sh      （合成单文件 build/model-int4.rp4，约 14.4 GB）
 #   引擎    bash build.sh                     （自研汇编器 + g++ 编出 build/rt）
 #   运行    bash serve.sh / bash run.sh
 set -euo pipefail
@@ -63,9 +63,9 @@ PY
 
 if [ "$CHECK_ONLY" = 1 ]; then
   hr "产物检查"
-  for f in models/Qwen3.8-27B-NVFP4/model.safetensors \
-           models/Qwen3.8-27B-NVFP4/rt4/qwen38_27b.rt4 \
-           models/Qwen3.8-27B-NVFP4/model.rp4 build/rt build/k100lc_all.hsaco; do
+  for f in models/Qwen3.8-27B-INT4/model.safetensors \
+           models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4 \
+           models/Qwen3.8-27B-INT4/model.rp4 build/rt build/k100lc_all.hsaco; do
     [ -e "$f" ] && echo "  OK   $f" || echo "  MISS $f"
   done
   exit 0
@@ -78,9 +78,9 @@ else
   hr "1/6 Python 依赖（跳过）"
 fi
 
-hr "2/6 下载源模型（unsloth/Qwen3.8-27B-NVFP4）"
-if [ -s models/Qwen3.8-27B-NVFP4/model.safetensors ] &&
-   [ -s models/Qwen3.8-27B-NVFP4/model_mtp.safetensors ]; then
+hr "2/6 下载源模型（默认 int4：RedHatAI/Qwen3.8-27B-INT4）"
+if [ -s models/Qwen3.8-27B-INT4/model.safetensors ] &&
+   [ -s models/Qwen3.8-27B-INT4/model_mtp.safetensors ]; then
   echo "  已存在，跳过（要重新校验：bash scripts/fetch_model.sh --check）"
 else
   bash scripts/fetch_model.sh
@@ -92,7 +92,7 @@ bash scripts/setup_models.sh
 hr "4/6 转换 RT4 权重（主机 gcc，约 4.5 分钟）"
 bash scripts/convert_weights.sh
 
-hr "5/6 合成单文件 model.rp4（约 15.8 GB）"
+hr "5/6 合成单文件 build/model-int4.rp4（约 14.4 GB）"
 bash scripts/pack_weights.sh
 
 hr "6/6 构建引擎（自研汇编器 + g++）"
@@ -101,4 +101,6 @@ bash build.sh
 hr "完成"
 echo "起网页控制台：  bash serve.sh"
 echo "命令行对话：    bash run.sh --prompt 你好 --n 64"
-echo "（maxtoken 默认 40960，上下文默认 40960；PORT=8080 bash serve.sh）"
+echo "（maxtoken 默认 40960，上下文默认 40960；默认监听 80，PORT=8080 可换端口）"
+echo "（默认模型 int4；要换 NVFP4 checkpoint：VARIANT=nvfp4 bash scripts/fetch_model.sh，"
+echo "  再 RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh）"

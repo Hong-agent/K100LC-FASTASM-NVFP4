@@ -1300,6 +1300,10 @@ struct Model {
     // 草稿链：K 步严格串行的 MTP 前向，**中间不回主机**（上一步的 argmax 就在设备上，
     // 直接当下一步的输入 token），只在最后回读 K 个 token。快照槽位 = 0..K-1。
     void mtp_draft_chain(int first_token, const float* hin, int K, int* out_ids);
+    // 采样式投机用：只跑一步 MTP，把 lm_head logits 拷回主机。温度 > 0 时草稿
+    // 必须从 MTP 自己的分布 q 里采（不能拿 argmax 当 q，那样接受率会崩），
+    // 所以链断在主机上：主机采出 token → 喂回设备跑下一步。
+    void mtp_draft_logits_step(int token, const float* hin, int snap_slot, float* host_logits);
     void mtp_extend_context(const int* ids_dev, int n, int abs_off);
     void mtp_extra_entry(int token, bool want_logits, int* argmax_out, int snap_slot = -1);
     void mtp_restore_stage(int slot);
@@ -1462,6 +1466,9 @@ void Model::init(const std::string& path, const std::string& json) {
         if (e && !strcmp(e, "0")) { /* 显式关闭 */ }
         else if (e && *e) p = e;
         // 默认找项目自己的 models/ 目录（scripts/env.sh 会显式设置 RT_RP4）。
+        // 默认模型是 int4；NVFP4 checkpoint 那份是 opt-in。
+        else if (access("models/Qwen3.8-27B-INT4/model.rp4", R_OK) == 0)
+            p = "models/Qwen3.8-27B-INT4/model.rp4";
         else if (access("models/Qwen3.8-27B-NVFP4/model.rp4", R_OK) == 0)
             p = "models/Qwen3.8-27B-NVFP4/model.rp4";
         if (!p.empty() && want_nvfp4) rp4_used = rp4_open(rp4, p);
@@ -2339,6 +2346,20 @@ int Model::mtp_draft_one(int token, const float* hin, int snap_slot) {
     return id;
 }
 
+// 采样式投机的一步：跑 MTP、快照 vstage、把草稿 logits 拷回主机（不取 argmax）。
+void Model::mtp_draft_logits_step(int token, const float* hin, int snap_slot,
+                                  float* host_logits) {
+    if (!mtp_on) return;
+    CK(hipMemcpyAsync(d.mtp_dids, &token, sizeof(int), hipMemcpyHostToDevice, 0));
+    mtp_layer_rows(d.mtp_dids, hin, 1, mtp_len, true, nullptr);
+    if (snap_slot >= 0) {
+        const size_t vs = (size_t)cfg.n_kv * BG * cfg.head_dim;
+        CK(hipMemcpyAsync(d.mtp_vstage_snap + (size_t)snap_slot * vs, mtp_vstage,
+                          vs * 4, hipMemcpyDeviceToDevice, 0));
+    }
+    CK(hipMemcpy(host_logits, d.mtp_logits, (size_t)248320 * 4, hipMemcpyDeviceToHost));
+}
+
 // 上面那版草稿（`mtp_draft_one`）每一步都要「argmax 回主机 → 再把 token 送回设备」，
 // 3 步就是 3 次流水线抽干 + 3 次往返；每轮墙钟里因此有一块（~8 ms/轮）不记在
 // 任何分阶段计时里。这一版把链留在设备上：草稿 i 的 argmax 写在 d.argmax[i]，
@@ -2703,9 +2724,92 @@ struct Sampler {
     std::vector<std::pair<float, int>> cand;   // (概率, id)
     std::vector<int> idx;
     std::vector<float> ex;                     // 无截断路径的 exp 缓存（省掉第二遍 expf）
+    // 投机采样（温度 > 0 时的 MTP）用：目标分布 p、草稿分布 q、残差 max(0,p-q)
+    std::vector<float> dp, dq, dr;
 
     uint32_t rnd() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return (uint32_t)(st >> 32); }
     float uni() { return (float)(rnd() >> 8) * (1.f / (float)(1u << 24)); }
+
+    // 用 splitmix64 把种子打散，再空转几轮。
+    // 原来这里是 `st = seed ^ 0x9E3779B97F4A7C15`，然后直接取第一次 xorshift 的
+    // 高 32 位 —— 低熵种子（1,2,3…）的第一次输出**逐位相同**，等于「换 seed 换不出
+    // 别的结果」（实测 seed=1..150 的第一个 token 全是同一个）。空转 + 打散之后
+    // 不同种子才真的给出不同的采样流。
+    void seed(uint64_t s) {
+        uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        st = z ^ (z >> 31);
+        for (int i = 0; i < 8; i++) rnd();          // 丢掉前 8 个，去种子相关性
+    }
+
+    // logits → **归一化**的采样分布（temp / top_p / top_k 与 pick() 是同一套语义），
+    // 截断掉的元素为 0。投机采样要拿它算接受概率 p(x)/q(x) 与残差 max(0, p-q)。
+    void dist(const float* lg, int V, std::vector<float>& out) {
+        out.assign((size_t)V, 0.f);
+        float mx = lg[0];
+        for (int i = 1; i < V; i++) mx = std::max(mx, lg[i]);
+        const float inv_t = 1.f / temp;
+        std::vector<float>& e = ex;
+        e.resize(V);
+        double sum = 0;
+        for (int i = 0; i < V; i++) {
+            const float v = expf((lg[i] - mx) * inv_t);
+            e[i] = v;
+            sum += (double)v;
+        }
+        if (top_k <= 0 && top_p >= 1.f) {        // 无截断：直接归一化
+            const float inv = (float)(1.0 / sum);
+            for (int i = 0; i < V; i++) out[i] = e[i] * inv;
+            return;
+        }
+        // 有截断：与 pick() 一样先取前 K 大（top_p 用「前 K 大」近似），再按 top_p 截。
+        const int K = std::min(V, top_k > 0 ? top_k : 2048);
+        idx.resize(V);
+        for (int i = 0; i < V; i++) idx[i] = i;
+        std::nth_element(idx.begin(), idx.begin() + K, idx.end(),
+                         [&](int a, int b) { return lg[a] > lg[b]; });
+        idx.resize(K);
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        int keep = K;
+        if (top_p < 1.f) {
+            double acc0 = 0;
+            for (int i = 0; i < K; i++) {
+                acc0 += e[idx[i]];
+                if (acc0 >= (double)top_p * sum) { keep = i + 1; break; }
+            }
+        }
+        double acc = 0;
+        for (int i = 0; i < keep; i++) acc += e[idx[i]];
+        const float inv = (float)(1.0 / acc);
+        for (int i = 0; i < keep; i++) out[idx[i]] = e[idx[i]] * inv;
+    }
+
+    // 从已归一化的分布里采一个 id
+    int pick_p(const std::vector<float>& p) {
+        const float r = uni();
+        float c = 0;
+        for (int i = 0; i < (int)p.size(); i++) {
+            c += p[i];
+            if (r <= c) return i;
+        }
+        return (int)p.size() - 1;
+    }
+
+    // 残差分布 max(0, p - q) 再归一化：拒绝草稿后要按它重新采一个 token，
+    // 这样「接受 + 拒绝重采」合起来才严格等于目标分布 p。
+    void residual(const std::vector<float>& p, const std::vector<float>& q) {
+        dr.resize(p.size());
+        double s = 0;
+        for (size_t i = 0; i < p.size(); i++) {
+            const float d = p[i] - q[i];
+            dr[i] = d > 0.f ? d : 0.f;
+            s += dr[i];
+        }
+        if (s <= 0) { dr = p; return; }          // 数值兜底（理论上 p==q 时才会碰到）
+        const float inv = (float)(1.0 / s);
+        for (auto& v : dr) v *= inv;
+    }
 
     // 采样器。原来 top_k=0/top_p=1 时会对全部 248320 个 logit 做一次 std::sort，
     // 墙钟实测比贪心慢 ~20 ms/token（见 RESUME 的「解码提速」第 1 条）。现在：
@@ -3148,7 +3252,7 @@ static void engine_loop(Model& m) {
             smp.top_p = f.size() > 2 ? (float)atof(f[2].c_str()) : 1.f;
             smp.top_k = f.size() > 3 ? atoi(f[3].c_str()) : 0;
             if (f.size() > 4 && !f[4].empty())
-                smp.st = (uint64_t)atoll(f[4].c_str()) ^ 0x9E3779B97F4A7C15ull;
+                smp.seed((uint64_t)atoll(f[4].c_str()));
             const std::vector<int> stops = f.size() > 5 ? parse_ids(f[5]) : std::vector<int>{};
             if (!have_logits) { printf("ERR no logits\n"); fflush(stdout); continue; }
             int produced = 0;
@@ -3159,7 +3263,15 @@ static void engine_loop(Model& m) {
             m.prof_reset();
             auto t0 = std::chrono::steady_clock::now();
             const size_t V = 248320;
-            if (m.mtp_on && smp.temp <= 0.f && m.mtp_n > 0) {
+            // 温度 > 0 也走 MTP（speculative sampling）：草稿从 MTP 自己的分布 q 里
+            // 采出来，主模型一次前向给出 p，按 min(1, p(x)/q(x)) 接受；被拒就从残差
+            // max(0, p-q) 重新采一个 —— 这样「接受的前缀 + 那个重采的 token」合起来
+            // 严格服从目标分布 p，与「不投机、逐 token 采样」逐位同分布。
+            // RT_MTP_SAMPLE=0 可以关掉（回到温度>0 就不投机）。
+            static const bool mtp_sample =
+                !(getenv("RT_MTP_SAMPLE") && atoi(getenv("RT_MTP_SAMPLE")) == 0);
+            if (m.mtp_on && m.mtp_n > 0 && (smp.temp <= 0.f || mtp_sample)) {
+                const bool sampling = smp.temp > 0.f;
                 // 贪心 MTP 投机：每轮草拟 K 个、主模型一次前向校验，接受前缀。
                 // RT_MTP_HOST_ARGMAX=1 退回旧的主机侧 argmax 路径（A/B 对照用）。
                 static const bool host_argmax =
@@ -3174,6 +3286,8 @@ static void engine_loop(Model& m) {
                 int last_K = 3, up_cnt = 0;
                 bool have_next = false;            // 设备侧路径：下轮首 token 已由 argmax 直出
                 int next_tok = 0;
+                std::vector<float> dlog;                 // 采样模式：K 行草稿 logits
+                std::vector<std::vector<float>> qrows(4); // 采样模式：草稿分布 q_0..q_{K-1}
                 while (produced < n) {
                     if (stop_pending()) { interrupted = true; break; }
                     int id;
@@ -3203,9 +3317,26 @@ static void engine_loop(Model& m) {
                     last_K = K;
                     mtp_rounds++;
                     int drafts[8];
-                    // 草稿链留在设备上（中间不回主机）；快照槽位 0..K-1 供回滚用
-                    { ProfTick _t(m.pa(P_MTPD));
-                      m.mtp_draft_chain(id, m.d.h_prev, K, drafts); }
+                    if (!sampling) {
+                        // 草稿链留在设备上（中间不回主机）；快照槽位 0..K-1 供回滚用
+                        ProfTick _t(m.pa(P_MTPD));
+                        m.mtp_draft_chain(id, m.d.h_prev, K, drafts);
+                    } else {
+                        // 温度 > 0：草稿必须从 MTP 分布 q 里采（拿 argmax 当 q 的话
+                        // 接受率会掉到 p(argmax) 那个量级），所以链断在主机上。
+                        ProfTick _t(m.pa(P_MTPD));
+                        dlog.resize((size_t)K * V);
+                        const float* hstep = m.d.h_prev;
+                        int cur = id;
+                        for (int i = 0; i < K; i++) {
+                            m.mtp_draft_logits_step(cur, hstep, i,
+                                                    dlog.data() + (size_t)i * V);
+                            smp.dist(dlog.data() + (size_t)i * V, (int)V, qrows[i]);
+                            cur = smp.pick_p(qrows[i]);
+                            drafts[i] = cur;
+                            hstep = m.d.mtp_out;
+                        }
+                    }
 
                     int cand[8];
                     cand[0] = id;
@@ -3223,7 +3354,32 @@ static void engine_loop(Model& m) {
                     // 1MB 是延迟受限的，两级归约版没有这个问题。
                     int am[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     int acc = 0;
-                    if (host_argmax) {
+                    int out_tok = -1;      // 采样模式：本轮那个「+1」token（残差/bonus）
+                    if (sampling) {
+                        // 拒绝采样：p 是主模型在这一行的分布，q 是草稿的分布。
+                        // 行 i 对应「前缀 + id + drafts[0..i-1]」之后的位置，和 q_i 同一条件。
+                        tlog.resize((size_t)(K + 1) * V);
+                        { ProfTick _t(m.pa(P_COPY));
+                          CK(hipMemcpy(tlog.data(), m.d.logits_all, tlog.size() * 4,
+                                       hipMemcpyDeviceToHost)); }
+                        { ProfTick _t(m.pa(P_SAMPLE));
+                          for (int i = 0; i < K; i++) {
+                              smp.dist(tlog.data() + (size_t)i * V, (int)V, smp.dp);
+                              const float qx = qrows[i][drafts[i]];
+                              const float px = smp.dp[drafts[i]];
+                              if (qx > 0.f && smp.uni() >= std::min(1.f, px / qx)) {
+                                  smp.residual(smp.dp, qrows[i]);   // 拒：按残差重采
+                                  out_tok = smp.pick_p(smp.dr);
+                                  break;
+                              }
+                              acc++;
+                          }
+                          if (out_tok < 0) {          // K 个全接受：从 bonus 行（行 K）采
+                              smp.dist(tlog.data() + (size_t)K * V, (int)V, smp.dp);
+                              out_tok = smp.pick_p(smp.dp);
+                          }
+                        }
+                    } else if (host_argmax) {
                         tlog.resize((size_t)(K + 1) * V);
                         { ProfTick _t(m.pa(P_COPY));
                           CK(hipMemcpy(tlog.data(), m.d.logits_all, tlog.size() * 4,
@@ -3249,7 +3405,8 @@ static void engine_loop(Model& m) {
                     if (K > 0) acc_ema = 0.85f * acc_ema + 0.15f * ((float)acc / K);
                     mtp_ema = acc_ema;
                     // 调试开关：强制全部拒绝，用来单独验证回滚路径与普通解码等价
-                    if (getenv("RT_MTP_FORCE_REJECT")) acc = 0;
+                    // （只对贪心路径有意义；采样路径下 acc 与 out_tok 必须自洽）
+                    if (!sampling && getenv("RT_MTP_FORCE_REJECT")) acc = 0;
                     if (getenv("RT_MTP_TRACE")) {
                         fprintf(stderr, "MTPROUND base=%d K=%d acc=%d drafts=", base, K, acc);
                         for (int i = 0; i < K; i++) fprintf(stderr, "%d,", drafts[i]);
@@ -3292,7 +3449,11 @@ static void engine_loop(Model& m) {
                     }
 
                     if (hit_stop || produced >= n) break;
-                    if (host_argmax) {
+                    if (sampling) {
+                        // 接受前缀之后那个 token 已经由残差/bonus 采样得到，直接用它
+                        next_tok = out_tok;
+                        have_next = true;
+                    } else if (host_argmax) {
                         ProfTick _t(m.pa(P_COPY));
                         memcpy(lg.data(), tlog.data() + (size_t)a_use * V, V * 4);
                     } else {
@@ -3630,7 +3791,17 @@ static bool rp4_available() {
     const char* e = getenv("RT_RP4");
     if (e && !strcmp(e, "0")) return false;
     if (e && *e) return access(e, R_OK) == 0;
+    // 默认模型是 int4（models/Qwen3.8-27B-INT4），找不到再退到 NVFP4 checkpoint 那份。
+    if (access("models/Qwen3.8-27B-INT4/model.rp4", R_OK) == 0) return true;
     return access("models/Qwen3.8-27B-NVFP4/model.rp4", R_OK) == 0;
+}
+
+// .rp4 里有没有某一「部分」（main / mtp / visual）？
+// 视觉塔是可选部分：默认布局不打包它，那时要退回单独的 qwen38_27b_vision.rt4。
+static bool rp4_has_part(const Rp4& r, const char* part) {
+    for (const Rp4Row& row : r.rows)
+        if (row.part == part) return true;
+    return false;
 }
 
 int main(int argc, char** argv) {
@@ -3716,6 +3887,16 @@ int main(int argc, char** argv) {
         vision_path.clear();
         vision_json.clear();
     }
+    // 视觉塔默认在 DCU 上跑（IMG_EMB）。但可以选择在 CPU 上算：
+    // RT_VISION_DEVICE=cpu 时引擎不加载那 0.93 GB 视觉权重，图片由
+    // scripts/vision_cpu.py 在 CPU 上编码，IMG_EMB 不可用。
+    if (const char* vd = getenv("RT_VISION_DEVICE")) {
+        if (!strcmp(vd, "cpu") && !vision_path.empty()) {
+            printf("视觉塔：RT_VISION_DEVICE=cpu —— 引擎不加载（图片走 CPU 编码器）\n");
+            vision_path.clear();
+            vision_json.clear();
+        }
+    }
     if (!dump.empty()) remove(dump.c_str());      // 每次运行重建 dump 文件
     Model m;
     m.stats = stats_flag;
@@ -3731,9 +3912,18 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     m.init(model, json);
     if (!vision_path.empty()) {
-        if (m.rp4_used) m.vm.init_from_rp4(m.rp4, m.rp4.dev);
-        else            m.vm.init(vision_path, vision_json);
-        m.vision_on = true;
+        // 视觉塔优先从 .rp4 的 visual 部分拿；默认布局不打包它（图片走 CPU 编码器），
+        // 这时退回单独的 qwen38_27b_vision.rt4；两个都没有就当没有视觉塔。
+        if (m.rp4_used && rp4_has_part(m.rp4, "visual")) {
+            m.vm.init_from_rp4(m.rp4, m.rp4.dev);
+            m.vision_on = true;
+        } else if (access(vision_path.c_str(), R_OK) == 0) {
+            m.vm.init(vision_path, vision_json);
+            m.vision_on = true;
+        } else {
+            printf("视觉塔：.rp4 里没有 visual 部分，%s 也不存在 —— 跳过（图片走 CPU 编码器）\n",
+                   vision_path.c_str());
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     m.reset_state();

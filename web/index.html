@@ -127,7 +127,7 @@
       <button class="icon-btn mobile-only" id="menuBtn" title="会话列表">☰</button>
       <div class="cwd-wrap">
         <label for="model">模型</label>
-        <input id="model" class="cwd-input" list="modelOptions" value="qwen38-rt"
+        <input id="model" class="cwd-input" list="modelOptions" value="qwen38-fastasm-int4"
                spellcheck="false" placeholder="模型名（不校验）">
         <datalist id="modelOptions"></datalist>
       </div>
@@ -149,7 +149,15 @@
       </div>
       <div class="field">
         <label for="temp">温度</label>
-        <input id="temp" type="number" value="0" step="0.1" min="0" max="2">
+        <input id="temp" type="number" value="0.95" step="0.05" min="0" max="2">
+      </div>
+      <div class="field">
+        <label for="topp">top-p</label>
+        <input id="topp" type="number" value="0.95" step="0.05" min="0" max="1">
+      </div>
+      <div class="field">
+        <label for="topk">top-k</label>
+        <input id="topk" type="number" value="40" step="1" min="0" max="1000">
       </div>
       <div class="field">
         <label for="maxTokens">最多 token</label>
@@ -254,6 +262,8 @@ const modelEl = document.getElementById('model');
 const modelOptions = document.getElementById('modelOptions');
 const effortEl = document.getElementById('effort');
 const tempEl = document.getElementById('temp');
+const topPEl = document.getElementById('topp');
+const topKEl = document.getElementById('topk');
 const maxEl = document.getElementById('maxTokens');
 const dotEl = document.getElementById('connDot');
 const statusEl = document.getElementById('connText');
@@ -890,13 +900,15 @@ async function send() {
 
   try {
     const body = {
-      model: modelEl.value.trim() || 'qwen38-rt',
+      model: modelEl.value.trim() || 'qwen38-fastasm-int4',
       messages: current.messages.map(m => ({
         role: m.role,
         content: (m.content !== undefined ? m.content : (m.text || '')),
       })),
       max_tokens: Math.max(1, parseInt(maxEl.value || '40960', 10)),
-      temperature: parseFloat(tempEl.value || '0'),
+      temperature: parseFloat(tempEl.value || '0.95'),
+      top_p: Math.min(1, Math.max(0, parseFloat(topPEl.value || '0.95'))),
+      top_k: Math.max(0, parseInt(topKEl.value || '40', 10)),
       stream: true,
       conversation_id: current.conversationId,
       skills: skillsEl.checked,

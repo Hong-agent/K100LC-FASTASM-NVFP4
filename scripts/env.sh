@@ -15,16 +15,27 @@
 export RT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
 # ---------------- 权重与产物 ----------------
-export RT_MODEL_DIR="${RT_MODEL_DIR:-$RT_ROOT/models/Qwen3.8-27B-NVFP4}"
+# 默认模型：Qwen3.8-27B-INT4（RedHatAI 原生 pack-quantized int4 checkpoint，
+# 由 tools/convert.c 的 int4 分支转成 RT4）。NVFP4 checkpoint 是显式 opt-in：
+#   RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 bash serve.sh
+export RT_MODEL_DIR="${RT_MODEL_DIR:-$RT_ROOT/models/Qwen3.8-27B-INT4}"
 export RT_RT4="${RT_RT4:-$RT_MODEL_DIR/rt4/qwen38_27b.rt4}"
 export RT_RT4_JSON="${RT_RT4_JSON:-$RT_MODEL_DIR/rt4/qwen38_27b.rt4.json}"
 export RT_MTP="${RT_MTP:-$RT_MODEL_DIR/rt4/qwen38_27b_mtp.rt4}"
 export RT_VISION_RT4="${RT_VISION_RT4:-$RT_MODEL_DIR/rt4/qwen38_27b_vision.rt4}"
+# 视觉塔默认在 DCU 上跑（引擎的 IMG_EMB，27 层）。**它不进 .rp4**：引擎直接从
+# 下面这个 RT_VISION_RT4 文件加载（默认打包 VISION_RP4=0）。
+# 想让 27 层改在 CPU 上算（scripts/vision_cpu.py，纯 NumPy，引擎不加载视觉权重）：
+# RT_VISION_DEVICE=cpu。
+export RT_VISION_DEVICE="${RT_VISION_DEVICE:-gpu}"
 
-# NVFP4 权重：优先用单文件 model.rp4（把主模型/NVFP4/MTP/视觉塔拼成一个连续文件），
-# 没有就退回「清单 + 原始 safetensors」直读。
-if [ -z "${RT_RP4:-}" ] && [ -r "$RT_MODEL_DIR/model.rp4" ]; then
-  export RT_RP4="$RT_MODEL_DIR/model.rp4"
+# 权重单文件：优先模型目录里的 model.rp4（离线包里就是它），其次 build/model-int4.rp4
+# （本机开发时 scripts/pack_weights.sh 的默认产物）。两者都没有时退回
+# 「NVFP4 清单 + 原始 safetensors」直读（只有 NVFP4 路线才用得上）。
+if [ -z "${RT_RP4:-}" ]; then
+  for _p in "$RT_MODEL_DIR/model.rp4" "$RT_ROOT/build/model-int4.rp4"; do
+    [ -r "$_p" ] && { export RT_RP4="$_p"; break; }
+  done
 fi
 export RT_NVFP4_MANIFEST="${RT_NVFP4_MANIFEST:-$RT_ROOT/build/nvfp4_manifest.tsv}"
 export RT_NVFP4_SAFETENSORS="${RT_NVFP4_SAFETENSORS:-$RT_ROOT/models/Qwen3.8-27B-NVFP4/model.safetensors}"

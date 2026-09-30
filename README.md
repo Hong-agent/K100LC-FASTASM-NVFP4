@@ -1,7 +1,20 @@
 # K100LC-FASTASM-NVFP4
 
 海光 **K100_LC（gfx926）** 上的自研推理栈：**自研汇编器 + 无 DTK 运行时 +
-NVFP4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网页控制台。
+RT4 int4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网页控制台。
+
+**默认模型 = int4**：`RedHatAI/Qwen3.8-27B-INT4`（落在 `models/Qwen3.8-27B-INT4/`，
+主模型 W4A8：int4 权重 × int8 激活，由 `tools/convert.c` 的 int4 分支转成 RT4）。
+`serve.sh` / `run.sh` / `deploy-offline.sh` / `scripts/pack_weights.sh` 默认都走它。
+上游 NVFP4 checkpoint 那条路线作为**显式 opt-in** 保留，靠 `RT_MODEL_DIR` / `RT_RP4`
+切换（见「默认模型与切换」一节）。
+
+**NVFP4 直跑为什么降级成备用选项**：本机 A/B 实测（[docs/BENCHLOG.md](docs/BENCHLOG.md)）
+全部线性层走 NVFP4 时预填充 **251.3 tok/s**，而 RT4 int4（W4A8）是 **295.3 tok/s**
+（**−15%**）；单矩阵 GEMV 慢 17%；`.rp4` 反而大 3.2%（16.263 vs 15.765 GB）。
+`nvfp4_gemm_kernel` 在 **M ≥ 1024 时还有已知的非法地址访问**，预填充只能靠
+`CHUNK=512` 绕着走。精度上 NVFP4 略好（权重相对 RMS ≈9.5%，对照 int4/128 的
+≈12%），但抵消不了性能与稳定性上的代价 —— 所以**默认不启用**，只作备用/对照。
 
 本项目由两条独立路线合并而来：
 
@@ -18,7 +31,8 @@ NVFP4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网页�
 > 80 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于原 DTK 编译产物
 > （NVFP4 GEMM 另有一个「精确形状」变体槽，共 81 个）；
 > 打成一个 371,896 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
-> **0**）；**全部 401 个线性层**都用 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
+> **0**）。默认的 int4 主模型走 RT4 W4A8（int4 权重 × int8 激活），不做 NVFP4
+> 替换；打开 `NVFP4_ALL=mlp|all` 才有 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
 > 原样（权重零误差），其余 233 个（注意力/线性注意力投影、lm_head、56~63 层 MLP）
 > 由 `tools/nvfp4_quant.py` 从 FP8 按同一规格重量化。
 
@@ -35,13 +49,64 @@ bash build.sh
 bash run.sh --prompt "你好，用一句话介绍你自己" --n 64
 
 # 3) 网页控制台（+ OpenAI 兼容接口）
-bash serve.sh                     # http://<本机IP>:8080/
+bash serve.sh                     # http://<本机IP>/（监听 80，局域网不用带端口号）
 bash serve.sh --stop
 ```
 
 > 源码包里带了 `prebuilt/rt` 与 `prebuilt/k100lc_all.hsaco`，**不编译也能直接跑**：
 > `run.sh` / `serve.sh` 找不到 `build/rt` 时会自动用 `prebuilt/rt`。
 > `build.sh` 只在你要重新生成内核机器码或改内核时才需要（那时才要主机 `g++`）。
+
+> **默认打包布局**（`bash scripts/pack_weights.sh`）：默认源是 `models/Qwen3.8-27B-INT4`，
+> 产物 `build/model-int4.rp4`（软链成 `models/Qwen3.8-27B-INT4/model.rp4`）；
+> 主模型用 RT4 的 **int4 权重
+> （W4A8：int4 权重 × int8 激活）**，不做 NVFP4 替换；MTP 头用 **int8
+> （W8A8：`.hi`/`.lo` 两张 int4 跑两遍相加）**；视觉塔**不装进 `.rp4`**——
+> 引擎直接从 `rt4/qwen38_27b_vision.rt4` 单独加载、27 层在 DCU 上跑
+> （`RT_VISION_DEVICE=gpu`，默认）；想换成 `scripts/vision_cpu.py` 的纯 CPU
+> 编码器就设 `RT_VISION_DEVICE=cpu`。
+> NVFP4 直跑改成显式 opt-in：`NVFP4_ALL=mlp`（168 个 MLP）或 `NVFP4_ALL=all`
+> （401 个线性层）；要把视觉塔放回 `.rp4`：`VISION_RP4=1`。
+
+## 默认模型与切换
+
+项目默认跑 **int4**（`models/Qwen3.8-27B-INT4`，源 checkpoint
+`RedHatAI/Qwen3.8-27B-INT4`）。所有入口都默认指向它：
+
+| 入口 | 默认行为 |
+|---|---|
+| `bash serve.sh` | 起网页 + `/v1`，模型名 `qwen38-fastasm-int4`，权重 `build/model-int4.rp4` |
+| `bash run.sh` | 命令行对话，RT4 取 `models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4` |
+| `bash scripts/fetch_model.sh` | 从魔搭拉 int4 checkpoint（`VARIANT=nvfp4` 换 NVFP4 那份） |
+| `bash scripts/convert_weights.sh` | 转换 `RT_MODEL_DIR` 里那份（默认 int4） |
+| `bash scripts/pack_weights.sh` | 打 `build/model-int4.rp4` |
+| `bash deploy-offline.sh` | 起服务，权重取 `models/Qwen3.8-27B-INT4/model.rp4` |
+
+切到上游 NVFP4 checkpoint（opt-in）只需要两个环境变量：
+
+```bash
+VARIANT=nvfp4 bash scripts/fetch_model.sh          # 下 NVFP4 checkpoint 那份（可选）
+RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh
+```
+
+再打开 NVFP4 直跑：`NVFP4_ALL=mlp|all bash scripts/pack_weights.sh`（见下文的打包说明）。
+`serve-int4.sh` 仍保留，但已经是 `PORT=8080 bash serve.sh` 的薄别名。
+
+**结论：NVFP4 直跑是备用选项，不是推荐配置。** 理由是实测不划算（同一台 K100_LC、
+`scripts/bench.sh` 默认档 8192 token 预填充 / 500 token 生成）：
+
+| 指标 | MLP 走 NVFP4（其余 RT4 int4） | 全部线性层 NVFP4 | 变化 |
+|---|---|---|---|
+| 预填充 tok/s | **295.3** | 251.3 | **−14.9%** |
+| 贪心解码 tok/s（MTP3） | 27.2 | 29.0 | +6.6% |
+| 贪心解码 tok/s（无 MTP） | 21.4 | 21.2 | −0.9% |
+| lm_head GEMV | 0.904 ms / 703 GB/s | 1.094 ms / 581 GB/s | −17% |
+| `.rp4` 体积 | 15.765 GB | 16.263 GB | +3.2% |
+| NVFP4 GEMM（q_proj 形状） | — | 9.8 TMAC/s | int4 两遍是 17.4（0.56×） |
+
+另外 `nvfp4_gemm_kernel` 在 M ≥ 1024 会触发非法地址访问（预填充 `CHUNK=512` 恰好避开）。
+权重精度上 NVFP4 更好（相对 RMS ≈9.5% vs int4/128 的 ≈12%），但换不来性能，
+于是把 NVFP4 从默认布局降为**备用/对照路径**：想要它的精度或做内核实验时再开。
 
 ## 两种部署方式
 
@@ -61,7 +126,7 @@ bash scripts/deploy_online.sh         # 下模型 → 转换 → 打包权重 �
 **离线整包**——源码 + 模型 + 驱动 + 自带运行时 + 预编译引擎，解压就能跑：
 
 ```bash
-bash scripts/make_offline_package.sh  # → dist/K100LC-FASTASM-NVFP4-离线部署-<日期>.zip（~16.3 GB）
+bash scripts/make_offline_package.sh  # → dist/K100LC-FASTASM-NVFP4-离线部署-<日期>.zip（~14.9 GB）
 # 目标机（不联网）：
 unzip K100LC-FASTASM-NVFP4-离线部署-<日期>.zip && cd K100LC-FASTASM-NVFP4
 HY_INSTALL_DRIVER=1 bash deploy-offline.sh    # 装驱动（不限内核）→ 起服务
@@ -81,12 +146,12 @@ HY_INSTALL_DRIVER=1 bash deploy-offline.sh    # 装驱动（不限内核）→ �
 > **不限内核版已挂到 Releases**（70 MB，md5 `fe80b298a3d3358a869de14105ada134`）：
 > <https://github.com/Hong-agent/K100LC-FASTASM-NVFP4/releases/tag/driver-rock-5.7.1-6.2.35-V1.6.7>
 
-`setup_models.sh` 默认从桌面找权重；也可以显式指定：
+`setup_models.sh` 默认从桌面找 int4 权重（`../Qwen3.8-27B-INT4`）；也可以显式指定：
 
 ```bash
-MODEL_SRC=/path/to/Qwen3.8-27B-NVFP4 \
+MODEL_SRC=/path/to/Qwen3.8-27B-INT4 \
 RT4_DIR=/path/to/converted/rt4 \
-RP4=/path/to/model.rp4 bash scripts/setup_models.sh
+RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 ```
 
 ## 实测（本机 K100_LC，2026-09-29）
@@ -96,8 +161,12 @@ RP4=/path/to/model.rp4 bash scripts/setup_models.sh
 | 自研汇编器 | 80/80 个模型内核从 `.s` 汇编，**逐字节等于原 DTK 编译产物**（207,296 B）+ 1 个手工变体（NVFP4 GEMM 精确形状槽） |
 | 自研 HSACO | 单文件 **371,896 B**，含 81 个内核；HSA 解析全部符号并执行 |
 | 运行时依赖 | `build/rt` 只链接 **libhsa-runtime64.so.1**；DTK 库引用 **0** |
-| 模型加载 | `.rp4` 单文件 **16.263 GB**，2001 张量（main 851 / NVFP4 802 / MTP+视觉 348） |
-| NVFP4 直跑 | **401 个线性层**走 NVFP4（其中 168 个 MLP 原样零误差，233 个由 FP8 重量化，实测相对 RMS ≈ 9.5%） |
+| 默认模型 | `RedHatAI/Qwen3.8-27B-INT4` → RT4 int4（W4A8）；主模型 851 张量 = 402 int4 + 353 f32 + 96 f16 |
+| 模型加载（默认） | int4 路线的 `.rp4` 单文件 **14.351 GB**，874 张量（main 851 / MTP 23），视觉塔不装进去 |
+| MTP 精度 | 头权重 **int8/W8A8**：int4 相对误差 ≈12.8% → **0.9%**，投机接受率更好 |
+| MTP 温度投机 | 温度 > 0 也走投机（草稿按 q 采样 + `min(1,p/q)` 接受 + 残差重采，分布严格等价）：**1.18~1.38×**。见 [docs/BENCHLOG.md](docs/BENCHLOG.md) |
+| 视觉塔 | **不装进 `.rp4`**：引擎从 `rt4/qwen38_27b_vision.rt4` 单独加载、在 DCU 上跑 27 层；也可 `RT_VISION_DEVICE=cpu` 走纯 NumPy |
+| NVFP4 直跑（opt-in） | `NVFP4_ALL=all` 时 **401 个线性层**走 NVFP4（168 个 MLP 原样零误差，233 个由 FP8 重量化，相对 RMS ≈ 9.5%），`.rp4` 16.263 GB / 2001 张量 |
 | 性能权衡 | 全部线性层 NVFP4 时预填充 **251 tok/s**、解码 21 tok/s；只让 MLP 走 NVFP4 时预填充 **295 tok/s**（`NVFP4_ALL=0` 打包）。见 [docs/BENCHLOG.md](docs/BENCHLOG.md) |
 | KV cache | 16 个注意力层跑 **int8**（每 dword 4 个元素，尺度 `amax/127`，与 Q/P 同走 `v_dot4_i32_i8`） |
 | 端到端对话 | 64 层模型，预填充 58 token，生成 48 token（墙钟 1.49 s），输出连贯 |
@@ -115,6 +184,7 @@ RP4=/path/to/model.rp4 bash scripts/setup_models.sh
 | `runtime/hsa_rt.{h,cpp}` | **无 DTK 运行时**：HSA 队列、投递、内存、同步的 HIP 兼容垫片 |
 | `src/model.cpp`、`src/k_*.hip` | 模型与内核启动代码（host 侧由 `tools/gen_nodtk.py` 自动改写） |
 | `web/index.html`、`web/style.css` | 网页控制台（从 K100LC-RT4 搬入本项目） |
+| `models/Qwen3.8-27B-INT4/` | **默认权重目录**（软链，不随仓库发布）：RT4 int4 主模型 + int8 MTP + 视觉塔 + `model.rp4`；NVFP4 checkpoint 在 `models/Qwen3.8-27B-NVFP4/`（opt-in） |
 | `scripts/serve.py` | OpenAI 兼容服务 + 静态网页 + 附件/视觉（后端 = 本项目 `build/rt`） |
 | `scripts/chat.py` | 命令行对话 |
 | `scripts/deploy_online.sh`、`scripts/fetch_model.sh` | 联网从零部署一条龙 / 拉源模型（断点续传） |
@@ -165,9 +235,9 @@ build/nodtk/*.cpp ──► g++ -lhsa-runtime64 ──► build/rt
 新生成的文件立刻带删除按钮。
 
 ```bash
-bash serve.sh                    # 默认 8080；网页 maxtoken 默认 40960、上下文 40960
-PORT=80 CTX=16384 MTP_N=0 bash serve.sh
-curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+bash serve.sh                    # 默认 80（http://<本机IP>/）；网页 maxtoken 默认 40960、上下文 40960
+PORT=8080 CTX=16384 MTP_N=0 bash serve.sh
+curl -s localhost/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"1+1=?"}],"max_tokens":16}'
 ```
 
@@ -176,14 +246,20 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 本身超长才报 413）。页面上的输入框、`serve.sh` 的 `RT_DEFAULT_MAX_TOKENS`、
 `scripts/serve.py --default-max-tokens` 都可以改。
 
+采样默认值是 **温度 0.95 / top-p 0.95 / top-k 40**（网页输入框、`scripts/chat.py`
+的 `--temp/--top-p/--top-k`、以及服务端 `RT_DEFAULT_TEMP/RT_DEFAULT_TOP_P/
+RT_DEFAULT_TOP_K` 都能改）。要贪心解码显式传 `temperature: 0` 即可——温度 > 0 时
+MTP 走的是严格等价的投机采样，见 [docs/BENCHLOG.md](docs/BENCHLOG.md)。
+
 ## 六个关键设计点
 
-第一，**NVFP4 直跑覆盖全部线性层**。`I = 2 x E2M1` 落在 [-12,12] 且是整数，
+第一，**NVFP4 直跑覆盖全部线性层（opt-in）**。`I = 2 x E2M1` 落在 [-12,12] 且是整数，
 所以 FP4 → int8 无损，可直接喂 `v_dot4_i32_i8`；MLP 那 168 个张量用的是
 checkpoint 原样 NVFP4（权重零误差），其余 233 个线性层由 `tools/nvfp4_quant.py`
 按**同一规格**（每 16 个 k 一个 E4M3 尺度 + 逐张量 F32 全局尺度）重量化，
 权重相对 RMS ≈ 9.5%（对照 RT4 int4/128 的 ≈ 12%）。
 代价是预填充慢 15%：RT4 的 W4A8 虽然跑两遍 int4 GEMM，每遍都比 NVFP4 GEMM 快得多。
+默认**不开**这条路（默认就是 RT4 int4/W4A8）；要开就 `NVFP4_ALL=mlp|all bash scripts/pack_weights.sh`。
 
 第二，**解码便宜**。`v_perm_b32` 当 8 字节 LUT，一个打包字解成两组 int8 约 19 条
 指令（2.6 条/元素），在访存受限的解码里是白送的。
