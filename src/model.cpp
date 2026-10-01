@@ -2898,7 +2898,7 @@ void Model::dump_x(int il, int n) {
     printf("  [dump] layer %d → %s (%d×%d)\n", il, dump_file.c_str(), n, cfg.hidden);
 }
 
-// 中间量 dump：tag = 1000 + 层号*100 + 阶段号（见 tools/ref_hf.py 的对照表）。
+// 中间量 dump：tag = 1000 + 层号*100 + 阶段号。
 // 只有 RT_DUMP_BUF=1 且给了 --dump 时才写，正常路径零开销。
 void Model::db(int il, int stage, const float* p, long long cnt) {
     static const int on = getenv("RT_DUMP_BUF") ? atoi(getenv("RT_DUMP_BUF")) : 0;
