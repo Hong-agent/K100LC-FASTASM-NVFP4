@@ -382,10 +382,67 @@ struct Mo35 {
 };
 
 // ---------------------------------------------------------------- 权重绑定 --
+// GGUF 里 GDN 的 value-head 顺序与 HF/引擎不同：GGUF 下标 i = g + Hk*v，
+// HF 下标 j = g*rep + v（rep = Hv/Hk）。不改内核，而是在上卡后把按 head
+// 分块的权重就地换成 HF 顺序（见 tools/gguf_vhead_perm.py 的同一套公式）。
+void permute_head_blocks(uint8_t* p, int n_heads, size_t block_bytes, int Hk, int rep) {
+    std::vector<uint8_t> tmp((size_t)n_heads * block_bytes);
+    memcpy(tmp.data(), p, tmp.size());
+    for (int j = 0; j < n_heads; j++) {
+        const int i = (j % rep) * Hk + j / rep;          // HF j ← GGUF i
+        memcpy(p + (size_t)j * block_bytes, tmp.data() + (size_t)i * block_bytes, block_bytes);
+    }
+}
+
+// 把一份张量（或其片段）的 head 分块换成 HF 顺序；rows=每一行有多少字节的块
+// axis_rows=true：head 是「行」方向（块 = 每 head 的整行）；false：head 在行内（列）
+void fix_vhead(DevTensor* t, int Hk, int Hv, int rows_per_head, bool axis_rows,
+               long long row_off = 0, long long n_rows = -1) {
+    const int rep = Hv / Hk;
+    const long long N = t->dims.size() > 1 ? t->dims[1] : 1;      // 行数
+    const long long row_bytes = t->nbytes / N;
+    if (n_rows < 0) n_rows = N - row_off;
+    std::vector<uint8_t> buf((size_t)n_rows * row_bytes);
+    CK(hipMemcpy(buf.data(), (const uint8_t*)t->p + (size_t)row_off * row_bytes,
+                 buf.size(), hipMemcpyDeviceToHost));
+    if (axis_rows) {
+        permute_head_blocks(buf.data(), Hv, (size_t)rows_per_head * row_bytes, Hk, rep);
+    } else {
+        const size_t blk = row_bytes / Hv;                        // 每 head 在行内的字节数
+        std::vector<uint8_t> tmp(blk);
+        for (long long r = 0; r < n_rows; r++) {
+            uint8_t* row = buf.data() + (size_t)r * row_bytes;
+            std::vector<uint8_t> whole(row_bytes);
+            memcpy(whole.data(), row, row_bytes);
+            for (int j = 0; j < Hv; j++) {
+                const int i = (j % rep) * Hk + j / rep;
+                memcpy(row + (size_t)j * blk, whole.data() + (size_t)i * blk, blk);
+            }
+        }
+    }
+    CK(hipMemcpy((uint8_t*)t->p + (size_t)row_off * row_bytes, buf.data(), buf.size(),
+                 hipMemcpyHostToDevice));
+}
+
+// 1-D f32 向量（A_log / dt_bias）：每个 value head 一个元素
+void fix_vhead_1d(DevTensor* t, int Hk, int Hv) {
+    const int rep = Hv / Hk;
+    std::vector<float> v((size_t)Hv), o((size_t)Hv);
+    CK(hipMemcpy(v.data(), t->p, (size_t)Hv * 4, hipMemcpyDeviceToHost));
+    for (int j = 0; j < Hv; j++) o[j] = v[(j % rep) * Hk + j / rep];
+    CK(hipMemcpy(t->p, o.data(), (size_t)Hv * 4, hipMemcpyHostToDevice));
+}
+
 const DevTensor* need(Weights35& w, const std::string& n) {
     const DevTensor* t = w.find(n);
     if (!t) { printf("缺张量 %s\n", n.c_str()); exit(1); }
     return t;
+}
+
+DevTensor* need_mut(Weights35& w, const std::string& n) {
+    auto it = w.t.find(n);
+    if (it == w.t.end()) { printf("缺张量 %s\n", n.c_str()); exit(1); }
+    return &it->second;
 }
 
 // 主机侧把 Q8_0 矩阵解成 f32 再上卡（只用于小张量：in_proj_a/b 这类）
@@ -452,9 +509,38 @@ void bind(Mo35& m) {
             L.sout = need(w, nm("ssm_out.weight"));
             L.alpha = q8_to_f32(w, nm("ssm_alpha.weight"));
             L.beta = q8_to_f32(w, nm("ssm_beta.weight"));
+            // GGUF 的 v-head 顺序 → HF/引擎顺序（否则门控/β/A_log/z/out_proj 全错位）
+            const int Hk = m.cfg.lk_head, Hv = m.cfg.lv_head, D = m.cfg.ldim;
+            const int qn = Hk * D, vn = Hv * D;
+            fix_vhead_1d(need_mut(w, nm("ssm_a")), Hk, Hv);
+            fix_vhead_1d(need_mut(w, nm("ssm_dt.bias")), Hk, Hv);
+            // alpha/beta：q8_to_f32 出来的 f32 副本也要按同一顺序重排
+            {
+                const int rep = Hv / Hk;
+                const int Kh = m.cfg.hidden;
+                std::vector<float> ta((size_t)Hv * Kh), tb((size_t)Hv * Kh);
+                CK(hipMemcpy(ta.data(), L.alpha, ta.size() * 4, hipMemcpyDeviceToHost));
+                CK(hipMemcpy(tb.data(), L.beta, tb.size() * 4, hipMemcpyDeviceToHost));
+                std::vector<float> oa(ta.size()), ob(tb.size());
+                (void)qn;
+                for (int j = 0; j < Hv; j++) {
+                    const int i = (j % rep) * Hk + j / rep;
+                    memcpy(oa.data() + (size_t)j * Kh, ta.data() + (size_t)i * Kh,
+                           (size_t)Kh * 4);
+                    memcpy(ob.data() + (size_t)j * Kh, tb.data() + (size_t)i * Kh,
+                           (size_t)Kh * 4);
+                }
+                CK(hipMemcpy(L.alpha, oa.data(), oa.size() * 4, hipMemcpyHostToDevice));
+                CK(hipMemcpy(L.beta, ob.data(), ob.size() * 4, hipMemcpyHostToDevice));
+            }
+            fix_vhead(need_mut(w, nm("attn_gate.weight")), Hk, Hv, D, true);
+            fix_vhead(need_mut(w, nm("ssm_out.weight")), Hk, Hv, D, false);
+            fix_vhead(need_mut(w, nm("ssm_conv1d.weight")), Hk, Hv, D, true, 2 * qn, vn);
+            fix_vhead(need_mut(w, nm("attn_qkv.weight")), Hk, Hv, D, true, 2 * qn, vn);
         }
     }
     printf("权重绑定完成：%d 层\n", m.cfg.n_layer);
+    fprintf(stderr, "权重绑定完成：%d 层\n", m.cfg.n_layer);
 }
 
 void alloc_bufs(Mo35& m) {
@@ -554,6 +640,14 @@ void moe(Mo35& m, int il) {
     const Cfg35& c = m.cfg;
     Mo35::L& L = m.Ls[il];
     const int H = c.hidden, MI = c.moe_inter, E = c.n_expert, TOP = c.top_k;
+    const bool dump = il == 0 && m.seq_len == 0 && getenv("RT_Q36_DUMP");
+    if (dump) {
+        std::vector<float> h((size_t)H);
+        CK(hipMemcpy(h.data(), m.x, (size_t)H * 4, hipMemcpyDeviceToHost));
+        std::string p = std::string(getenv("RT_Q36_DUMP")) + ".moe_in.f32";
+        FILE* fp = fopen(p.c_str(), "wb");
+        if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
+    }
     k_rmsnorm(m.xb, m.x, (const float*)L.post_ln->p, 1, H, c.eps, false);
 
     // 路由（f32 [H,E]）→ 主机 top-k + 重归一
@@ -610,6 +704,13 @@ void moe(Mo35& m, int il) {
         TRACE_SYNC("exp acc ok");
     }
     k_add_inplace(m.x, m.acc, H);
+    if (dump) {
+        std::vector<float> h((size_t)H);
+        CK(hipMemcpy(h.data(), m.x, (size_t)H * 4, hipMemcpyDeviceToHost));
+        std::string p = std::string(getenv("RT_Q36_DUMP")) + ".moe_out.f32";
+        FILE* fp = fopen(p.c_str(), "wb");
+        if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
+    }
     TRACE_SYNC("moe final add ok");
 }
 
@@ -620,16 +721,38 @@ void attn_full(Mo35& m, int il) {
     Mo35::L& L = m.Ls[il];
     const int H = c.n_head, KV = c.n_kv, D = c.head_dim, Hd = c.hidden;
     const int qd = H * D, pd = qd * 2;
+    const bool dump = il == 3 && m.seq_len <= 1 && getenv("RT_Q36_DUMP");
+    auto dumpf = [&](const char* tag, const float* p, int n) {
+        if (!dump) return;
+        std::vector<float> h((size_t)n);
+        CK(hipMemcpy(h.data(), p, (size_t)n * 4, hipMemcpyDeviceToHost));
+        std::string path = std::string(getenv("RT_Q36_DUMP")) + "." + tag + ".f32";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
+    };
     k_rmsnorm(m.xb, m.x, (const float*)L.in_ln->p, 1, Hd, c.eps, false);
     lin_q8(m, m.qfull, L.q, m.xb);
     lin_q8(m, m.hkk, L.k, m.xb);
     lin_q8(m, m.hvv, L.v, m.xb);
     k_gather_heads(m.hq, m.qfull, 1, H, D, pd, 0, 2 * D);
     k_gather_heads(m.hgate, m.qfull, 1, H, D, pd, D, 2 * D);
+    dumpf("l3_xb", m.xb, Hd);
+    dumpf("l3_qfull", m.qfull, pd);
+    dumpf("l3_hkk_pre", m.hkk, KV * D);
+    dumpf("l3_hvv", m.hvv, KV * D);
+    dumpf("l3_hq_pre", m.hq, qd);
+    dumpf("l3_hgate", m.hgate, qd);
     // 注意：Qwen3.6(qwen35moe) 的 q/k norm 是**标准 RMSNorm**（权重均值≈1.3，
     // 与 27B/Qwen3.5 的 zero-centered 写法不同，27B 那份均值≈0.23 才用 (1+w)）
     k_rmsnorm(m.hq, m.hq, (const float*)L.qnorm->p, H, D, c.eps, false);
     k_rmsnorm(m.hkk, m.hkk, (const float*)L.knorm->p, KV, D, c.eps, false);
+    {
+        char tag[64];
+        snprintf(tag, sizeof(tag), "l3_s%d_hq_prerope", m.seq_len);
+        dumpf(tag, m.hq, qd);
+        snprintf(tag, sizeof(tag), "l3_s%d_hk_prerope", m.seq_len);
+        dumpf(tag, m.hkk, KV * D);
+    }
     k_rope(m.hq, m.hkk, nullptr, m.seq_len, 1, 1, H, KV, D, c.rot, c.rope_theta);
     k_scale(m.hq, 1.f / sqrtf((float)D), (long long)qd);
     k_attn_q_quant(m.qq, m.qs, m.hq, 1, H, D, 128, m.TP);
@@ -640,6 +763,17 @@ void attn_full(Mo35& m, int il) {
     k_attention(m.hfa, m.qq, m.qs, m.kc[il], m.ksc[il], m.vc[il], m.vsc[il],
                 m.TP, 1, n_kv, m.seq_len, (n_kv + 63) / 64, H, H / KV, m.max_ctx,
                 m.pout, m.pmax, m.psum, 8);
+    {
+        char tag[64];
+        snprintf(tag, sizeof(tag), "l3_s%d_hfa", m.seq_len);
+        dumpf(tag, m.hfa, H * m.TP * D);
+        snprintf(tag, sizeof(tag), "l3_s%d_hq_rope", m.seq_len);
+        dumpf(tag, m.hq, qd);
+        snprintf(tag, sizeof(tag), "l3_s%d_hkk_rope", m.seq_len);
+        dumpf(tag, m.hkk, KV * D);
+        snprintf(tag, sizeof(tag), "l3_s%d_hvv", m.seq_len);
+        dumpf(tag, m.hvv, KV * D);
+    }
     k_scatter_heads(m.hout, m.hfa, 1, H, D, qd, 0, m.TP);
     k_sigmoid_mul(m.hout, m.hout, m.hgate, qd);
     lin_q8(m, m.tmp, L.o, m.hout);
@@ -653,9 +787,21 @@ void attn_lin(Mo35& m, int il) {
     Mo35::L& L = m.Ls[il];
     const int Hd = c.hidden, Hk = c.lk_head, Hv = c.lv_head, D = c.ldim;
     const int qn = Hk * D, vn = Hv * D, C = qn * 2 + vn, K = c.conv_k;
+    const bool dump = il == 0 && m.seq_len == 0 && getenv("RT_Q36_DUMP");
+    auto dumpf = [&](const char* tag, const float* p, int n) {
+        if (!dump) return;
+        std::vector<float> h((size_t)n);
+        CK(hipMemcpy(h.data(), p, (size_t)n * 4, hipMemcpyDeviceToHost));
+        std::string path = std::string(getenv("RT_Q36_DUMP")) + "." + tag + ".f32";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
+    };
     k_rmsnorm(m.xb, m.x, (const float*)L.in_ln->p, 1, Hd, c.eps, false);
     lin_q8(m, m.qkv3, L.qkv, m.xb);
     lin_q8(m, m.z_, L.z, m.xb);
+    dumpf("l0_xb", m.xb, Hd);
+    dumpf("l0_qkv", m.qkv3, C);
+    dumpf("l0_z", m.z_, vn);
     STEP("attn_lin: conv");
     CK(hipMemcpyAsync(m.conv_prev, m.conv_state[il], (size_t)(K - 1) * C * 4,
                       hipMemcpyDeviceToDevice, 0));
@@ -669,21 +815,62 @@ void attn_lin(Mo35& m, int il) {
                   (const float*)L.dtb->p, (const float*)L.alog->p, 1, Hv, Hd);
     k_gdn(m.hout, m.gq, m.gk, m.gv, m.gg, m.gbeta, m.ssm_state[il],
           1, Hk, Hv, D, Hv / Hk);
+    dumpf("l0_conv", m.conv, C);
+    dumpf("l0_gq", m.gq, qn);
+    dumpf("l0_gk", m.gk, qn);
+    dumpf("l0_gv", m.gv, vn);
+    dumpf("l0_gab", m.gab, 2 * Hv);
+    dumpf("l0_gbeta", m.gbeta, Hv);
+    dumpf("l0_gg", m.gg, Hv);
+    dumpf("l0_gdn", m.hout, vn);
     STEP("attn_lin: out");
     k_rmsnorm_gated(m.hout, m.hout, (const float*)L.snorm->p, m.z_, Hv, D, c.eps);
+    dumpf("l0_gnorm", m.hout, vn);
     lin_q8(m, m.tmp, L.sout, m.hout);
+    dumpf("l0_out", m.tmp, Hd);
     k_add_inplace(m.x, m.tmp, Hd);
 }
 
 int forward1(Mo35& m, int id) {
     STEP("forward1: embed");
     embed_row(m, id);
+    const char* dump_all = getenv("RT_Q36_DUMP_ALL");
+    auto dumpx = [&](const char* fmt, int il) {
+        if (!dump_all || m.seq_len != 0) return;
+        std::vector<float> h((size_t)m.cfg.hidden);
+        CK(hipMemcpy(h.data(), m.x, (size_t)m.cfg.hidden * 4, hipMemcpyDeviceToHost));
+        char nm[256];
+        snprintf(nm, sizeof(nm), fmt, dump_all, il);
+        FILE* fp = fopen(nm, "wb");
+        if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
+    };
+    dumpx("%s/L%d_in.f32", 0);
+    if (getenv("RT_Q36_STATS")) {
+        static std::vector<float> h;
+        h.resize(m.cfg.hidden);
+        CK(hipMemcpy(h.data(), m.x, (size_t)m.cfg.hidden * 4, hipMemcpyDeviceToHost));
+        double s = 0, mx = 0;
+        for (float v : h) { s += (double)v * v; if (fabs(v) > mx) mx = fabs(v); }
+        fprintf(stderr, "   EMB  rms=%.4f max=%.3f first=%.4f\n", sqrt(s / m.cfg.hidden), mx, h[0]);
+    }
     for (int il = 0; il < m.cfg.n_layer; il++) {
         if (m.cfg.is_full(il)) attn_full(m, il);
         else                   attn_lin(m, il);
         TRACE_SYNC("attn ok");
+        dumpx("%s/L%d_mix.f32", il);
         moe(m, il);
         TRACE_SYNC("moe ok");
+        dumpx("%s/L%d_out.f32", il);
+        dumpx("%s/L%d_in.f32", il + 1);
+        if (getenv("RT_Q36_STATS")) {          // 每层隐藏态 RMS / 极值（定位数值问题）
+            static std::vector<float> h;
+            h.resize(m.cfg.hidden);
+            CK(hipMemcpy(h.data(), m.x, (size_t)m.cfg.hidden * 4, hipMemcpyDeviceToHost));
+            double s = 0, mx = 0;
+            for (float v : h) { s += (double)v * v; if (fabs(v) > mx) mx = fabs(v); }
+            fprintf(stderr, "   L%-3d rms=%.4f max=%.3f first=%.4f\n", il,
+                    sqrt(s / m.cfg.hidden), mx, h[0]);
+        }
         if ((il + 1) % 10 == 0 || il == m.cfg.n_layer - 1)
             fprintf(stderr, "   层 %d/%d\n", il + 1, m.cfg.n_layer);
     }
@@ -698,6 +885,18 @@ int forward1(Mo35& m, int id) {
     int best = -1;
     CK(hipMemcpy(&best, d_best, 4, hipMemcpyDeviceToHost));
     CK(hipFree(d_best));
+    if (getenv("RT_Q36_TOPK")) {                 // 诊断：打印 top-k logits
+        std::vector<float> lg((size_t)m.cfg.vocab);
+        CK(hipMemcpy(lg.data(), m.logits, (size_t)m.cfg.vocab * 4, hipMemcpyDeviceToHost));
+        std::vector<int> id((size_t)m.cfg.vocab);
+        for (int i = 0; i < m.cfg.vocab; i++) id[i] = i;
+        const int k = atoi(getenv("RT_Q36_TOPK"));
+        std::partial_sort(id.begin(), id.begin() + k, id.end(),
+                          [&](int a, int b) { return lg[a] > lg[b]; });
+        fprintf(stderr, "  top%d:", k);
+        for (int i = 0; i < k; i++) fprintf(stderr, " %d(%.2f)", id[i], lg[id[i]]);
+        fprintf(stderr, "\n");
+    }
     m.seq_len++;
     return best;
 }
@@ -833,6 +1032,26 @@ int run_moe35(int argc, char** argv) {
             if (sp != std::string::npos) { op = line.substr(0, sp); arg = line.substr(sp + 1); }
             if (op == "QUIT") break;
             if (op == "RESET") {
+                // 常驻引擎必须把状态清干净：KV / 卷积状态 / SSM 递推状态
+                for (int il = 0; il < m.cfg.n_layer; il++) {
+                    if (m.cfg.is_full(il)) {
+                        CK(hipMemset(m.kc[il], 0, (size_t)m.cfg.n_kv * m.max_ctx *
+                                                   (m.cfg.head_dim / KVEL) * 4));
+                        CK(hipMemset(m.ksc[il], 0, (size_t)m.cfg.n_kv * 2 * m.max_ctx * 4));
+                        CK(hipMemset(m.vc[il], 0, (size_t)m.cfg.n_kv *
+                                                   (m.max_ctx / KVEL) * m.cfg.head_dim * 4));
+                        CK(hipMemset(m.vsc[il], 0, (size_t)m.cfg.n_kv *
+                                                   (m.max_ctx / 64) * m.cfg.head_dim * 4));
+                        CK(hipMemset(m.vstage[il], 0, (size_t)m.cfg.n_kv * 64 *
+                                                      m.cfg.head_dim * 4));
+                    } else {
+                        CK(hipMemset(m.conv_state[il], 0,
+                                     (size_t)(m.cfg.conv_k - 1) *
+                                     (m.cfg.lk_head * 2 + m.cfg.lv_head) * m.cfg.ldim * 4));
+                        CK(hipMemset(m.ssm_state[il], 0, (size_t)m.cfg.lv_head *
+                                                         m.cfg.ldim * m.cfg.ldim * 4));
+                    }
+                }
                 m.seq_len = 0; last = -1;
                 printf("OK reset\n");
             } else if (op == "MTP") {
