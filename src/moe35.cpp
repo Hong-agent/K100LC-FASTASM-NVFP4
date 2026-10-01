@@ -624,8 +624,10 @@ void attn_full(Mo35& m, int il) {
     lin_q8(m, m.hvv, L.v, m.xb);
     k_gather_heads(m.hq, m.qfull, 1, H, D, pd, 0, 2 * D);
     k_gather_heads(m.hgate, m.qfull, 1, H, D, pd, D, 2 * D);
-    k_rmsnorm(m.hq, m.hq, (const float*)L.qnorm->p, H, D, c.eps, true);
-    k_rmsnorm(m.hkk, m.hkk, (const float*)L.knorm->p, KV, D, c.eps, true);
+    // 注意：Qwen3.6(qwen35moe) 的 q/k norm 是**标准 RMSNorm**（权重均值≈1.3，
+    // 与 27B/Qwen3.5 的 zero-centered 写法不同，27B 那份均值≈0.23 才用 (1+w)）
+    k_rmsnorm(m.hq, m.hq, (const float*)L.qnorm->p, H, D, c.eps, false);
+    k_rmsnorm(m.hkk, m.hkk, (const float*)L.knorm->p, KV, D, c.eps, false);
     k_rope(m.hq, m.hkk, nullptr, m.seq_len, 1, 1, H, KV, D, c.rot, c.rope_theta);
     k_scale(m.hq, 1.f / sqrtf((float)D), (long long)qd);
     k_attn_q_quant(m.qq, m.qs, m.hq, 1, H, D, 128, m.TP);
@@ -816,14 +818,18 @@ int run_moe35(int argc, char** argv) {
     for (size_t i = 0; i < ids.size(); i++) {
         const int64_t t0 = (int64_t)time(nullptr);
         last = forward1(m, ids[i]);
-        printf("  in=%d → next=%d（%.1fs，seq_len=%d）\n", ids[i], last,
-               (double)((int64_t)time(nullptr) - t0), m.seq_len);
+        fprintf(stderr, "  in=%d → next=%d（%.1fs，seq_len=%d）\n", ids[i], last,
+                (double)((int64_t)time(nullptr) - t0), m.seq_len);
     }
+    if (last >= 0) printf("TOKEN %d\n", last);
+    fflush(stdout);
     for (int i = 0; i < gen_n; i++) {
         const int64_t t0 = (int64_t)time(nullptr);
         last = forward1(m, last);
-        printf("  gen %d → %d（%.1fs）\n", i, last,
-               (double)((int64_t)time(nullptr) - t0));
+        printf("TOKEN %d\n", last);
+        fflush(stdout);
+        fprintf(stderr, "  gen %d → %d（%.1fs）\n", i, last,
+                (double)((int64_t)time(nullptr) - t0));
     }
     return 0;
 }
