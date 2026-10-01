@@ -400,6 +400,7 @@ bool w8_on() {
     return !(e && e[0] == '0' && e[1] == 0);
 }
 
+// 专家权重 gather（把 8 个专家的 gate/up/down gather 成连续块再各打一次 GEMV）。
 // W8 打包的共用部分：把「一行里第 g 组的 128 个 f32 权重」量化成
 // q ∈ [-120,119]（尺度 sc = amax/119，留出 int4 高位不溢出），再拆成
 // q = 16*hi + lo（hi、lo 都是二进制补码 int4 ∈ [-8,7]）。
@@ -591,6 +592,10 @@ void lin_w8(float* y, const W8& w, const float* x, int rows, int n_out,
 }
 
 // 同 lin_w8，但激活已经在量化缓冲里（调用前先 k_w4a8_quant）。
+// 专家权重 gather 开关（见 kernels/asm/k_moe/gather_exp_k.s）：
+// **默认关**（内核能汇编、但首次跑出现非法地址访问，数值还没对拍通过），
+// 用 RT_Q36_GATHER=1 打开做调试。
+bool gather_on = getenv("RT_Q36_GATHER") && atoi(getenv("RT_Q36_GATHER")) != 0;
 // aoff 是激活在量化缓冲里的元素偏移（GRP 的整数倍）——MoE 里 8 个专家的
 // gate/up 共用同一份 xb，down 的 8 份输入也拼成一块只量化一次。
 void lin_w8_q(float* y, const W8& w, int n_out, long long row_off, long long aoff, float* tmp) {
@@ -651,6 +656,11 @@ struct Mo35 {
           *psum = nullptr, *conv_prev = nullptr;
     u32* qq = nullptr;
     float* qs = nullptr;
+    // 专家权重 gather 暂存（见 kernels/asm/k_moe/gather_exp_k.s）：
+    // stage_q 放 hi/lo 两张 int4（gate/up 与 down 的最大需求一样大），
+    // stage_s 放对应的 f16 尺度。
+    u32* stage_q = nullptr;
+    uint16_t* stage_s = nullptr;
     std::vector<u32*> kc; std::vector<float*> ksc;
     std::vector<u32*> vc; std::vector<float*> vsc; std::vector<float*> vstage;
     std::vector<float*> conv_state, ssm_state;
@@ -895,6 +905,17 @@ void alloc_bufs(Mo35& m) {
     m.gab = m.alloc(2 * c.lv_head); m.gbeta = m.alloc(c.lv_head); m.gg = m.alloc(c.lv_head);
     m.gbuf = m.alloc(MI); m.ubuf = m.alloc(MI); m.dbuf = m.alloc(H);
     m.g8 = m.alloc((size_t)c.top_k * MI); m.u8 = m.alloc((size_t)c.top_k * MI);
+    // gather 暂存：gate/up 是 [TOP*MI 行][K=H]，down 是 [H 行][K'=TOP*MI]，
+    // 两者的字节数一样（都是 TOP*MI*H/2 字节 × hi/lo 两张）。
+    {
+        const long long rows_gu = (long long)c.top_k * MI;
+        const long long dw_gu = 2 * rows_gu * (H / 8);                       // dword 数
+        const long long dw_dn = 2 * (long long)H * (rows_gu / 8);
+        m.stage_q = m.alloc_u32((size_t)std::max(dw_gu, dw_dn));
+        const long long sc_gu = rows_gu * (H / 128) * 2;                     // f16 个数
+        const long long sc_dn = (long long)H * (rows_gu / 128) * 2;
+        m.stage_s = (uint16_t*)m.alloc_u32((size_t)(std::max(sc_gu, sc_dn) + 1) / 2);
+    }
     m.acc = m.alloc(H); m.router = m.alloc(E);
     m.shexp = m.alloc(1);
     m.conv_prev = m.alloc((c.conv_k - 1) * C);
@@ -1051,6 +1072,9 @@ void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
     // W8 路径下：xb 只量化一次，本层所有 gate/up（路由、共享专家门、8 个专家）
     // 复用同一份量化激活 —— 原来每个专家都自己量化一遍（每次 1 次内核投递）。
     const bool pq = w8_on() && m.w8.count(L.gexp) && m.w8.count(L.uexp) && m.w8.count(L.dexp);
+    // gather 会把 8 个专家的权重搬成连续块，gate/up/down 各只打一次 GEMV；
+    // 没有 gather 内核（或 RT_Q36_GATHER=0）时退回「每个专家一次调用」。
+    const bool gt = pq && gather_on;
     if (pq) k_w4a8_quant(m.xb, H);
     const long long q0 = pq ? 0 : -1;
     // 路由（f32 [H,E]）→ 主机 top-k + 重归一
@@ -1083,12 +1107,36 @@ void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
     TRACE_SYNC("shexp gate ok");
     lin_q8(m, m.ubuf, L.sup, m.xb, -1, q0);
     STEP("moe: experts");
-    for (int k = 0; k < TOP; k++) {
-        const int e = idx[k];
-        STEP("moe: expert gate");
-        lin_q8(m, m.g8 + (size_t)k * MI, L.gexp, m.xb, e, q0);
-        STEP("moe: expert up");
-        lin_q8(m, m.u8 + (size_t)k * MI, L.uexp, m.xb, e, q0);
+    // 8 个专家的 gate/up：把权重 gather 成连续块，一次 GEMV 算完 8 个专家
+    // （原来每个专家一次调用：每层 8×2 次 ×(hi+lo+加) = 48 次投递，
+    //  单次 8.4 µs，光投递就 0.4 ms/层）。
+    if (gt) {
+        CK(hipMemcpy(m.ids_exp, idx.data(), (size_t)TOP * 4, hipMemcpyHostToDevice));
+        const int rows_gu = TOP * MI, bpe_w = H / 2, bpe_s = (H / 128) * 2;
+        const size_t lo_q = (size_t)rows_gu * (H / 8);      // 一张 int4 的 dword 数
+        const size_t lo_s = (size_t)rows_gu * (H / 128);    // 一张尺度的 f16 数
+        const W8& wg = m.w8[L.gexp];
+        const W8& wu = m.w8[L.uexp];
+        for (int pass = 0; pass < 2; pass++) {              // 0=gate, 1=up
+            const W8& w = pass ? wu : wg;
+            float* y = pass ? m.u8 : m.g8;
+            k_gather_exp(m.stage_q, w.hi, m.ids_exp, MI, bpe_w, 4, TOP, 0);
+            k_gather_exp(m.stage_q + lo_q, w.lo, m.ids_exp, MI, bpe_w, 4, TOP, 0);
+            k_gather_exp(m.stage_s, (const void*)w.shi, m.ids_exp, MI, bpe_s, 4, TOP, 0);
+            k_gather_exp(m.stage_s + lo_s, (const void*)w.slo, m.ids_exp, MI, bpe_s, 4, TOP, 0);
+            k_w4a8_run1(y, m.stage_q, (const float*)m.stage_s, rows_gu, H, 0);
+            k_w4a8_run1(m.tmp8, m.stage_q + lo_q, (const float*)(m.stage_s + lo_s),
+                        rows_gu, H, 0);
+            k_add_inplace(y, m.tmp8, rows_gu);
+        }
+    } else {
+        for (int k = 0; k < TOP; k++) {
+            const int e = idx[k];
+            STEP("moe: expert gate");
+            lin_q8(m, m.g8 + (size_t)k * MI, L.gexp, m.xb, e, q0);
+            STEP("moe: expert up");
+            lin_q8(m, m.u8 + (size_t)k * MI, L.uexp, m.xb, e, q0);
+        }
     }
     TRACE_SYNC("exp gate/up ok");
     // silu（8 个专家一次算完；共享专家另一块）
@@ -1101,17 +1149,39 @@ void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
     const float sg = 1.f / (1.f + expf(-shexp_gate));
     k_scale(m.dbuf, sg, H);
     k_add_inplace(m.acc, m.dbuf, H);
-    // 8 个专家的 down：把 8 份 silu 输出拼成一块 [TOP][MI]，量化一次全用上
-    if (pq) k_w4a8_quant(m.g8, (long long)TOP * MI);
-    for (int k = 0; k < TOP; k++) {
-        const int e = idx[k];
-        const float we = (float)(r[e] / wsum);
-        STEP("moe: expert down");
-        lin_q8(m, m.dbuf, L.dexp, m.g8 + (size_t)k * MI, e, pq ? (long long)k * MI : -1);
-        TRACE_SYNC("exp down ok");
-        k_scale(m.dbuf, we, H);
+    if (gt) {
+        // 路由权重折进激活，再把 8 个专家的 down 权重按 K 方向交织 gather：
+        //   Σ_e w_e·W_e[n]·x_e = (按 K 拼好的大矩阵) · (按 K 拼好的激活)
+        // 于是 8 次 down 投影变成 1 次（K' = TOP*MI）。
+        for (int k = 0; k < TOP; k++)
+            k_scale(m.g8 + (size_t)k * MI, (float)(r[idx[k]] / wsum), MI);
+        const int Kd = TOP * MI;
+        k_w4a8_quant(m.g8, Kd);
+        const W8& wd = m.w8[L.dexp];
+        const size_t lo_q = (size_t)H * (Kd / 8);
+        const size_t lo_s = (size_t)H * (Kd / 128);
+        k_gather_exp(m.stage_q, wd.hi, m.ids_exp, H, MI / 2, 4, TOP, 1);
+        k_gather_exp(m.stage_q + lo_q, wd.lo, m.ids_exp, H, MI / 2, 4, TOP, 1);
+        k_gather_exp(m.stage_s, (const void*)wd.shi, m.ids_exp, H, (MI / 128) * 2, 2, TOP, 1);
+        k_gather_exp(m.stage_s + lo_s, (const void*)wd.slo, m.ids_exp, H,
+                     (MI / 128) * 2, 2, TOP, 1);
+        k_w4a8_run1(m.dbuf, m.stage_q, (const float*)m.stage_s, H, Kd, 0);
+        k_w4a8_run1(m.tmp8, m.stage_q + lo_q, (const float*)(m.stage_s + lo_s), H, Kd, 0);
+        k_add_inplace(m.dbuf, m.tmp8, H);
         k_add_inplace(m.acc, m.dbuf, H);
-        TRACE_SYNC("exp acc ok");
+    } else {
+        // 8 个专家的 down：把 8 份 silu 输出拼成一块 [TOP][MI]，量化一次全用上
+        if (pq) k_w4a8_quant(m.g8, (long long)TOP * MI);
+        for (int k = 0; k < TOP; k++) {
+            const int e = idx[k];
+            const float we = (float)(r[e] / wsum);
+            STEP("moe: expert down");
+            lin_q8(m, m.dbuf, L.dexp, m.g8 + (size_t)k * MI, e, pq ? (long long)k * MI : -1);
+            TRACE_SYNC("exp down ok");
+            k_scale(m.dbuf, we, H);
+            k_add_inplace(m.acc, m.dbuf, H);
+            TRACE_SYNC("exp acc ok");
+        }
     }
     k_add_inplace(x, m.acc, H);
     if (dump) {
@@ -2072,6 +2142,97 @@ int run_moe35(int argc, char** argv) {
             }
             fflush(stdout);
         }
+        return 0;
+    }
+    // gather 自检：把第 0 层的 gate / down 用 gather+GEMV 算一遍，与「逐专家」对拍。
+    if (getenv("RT_Q36_GATHERCHK")) {
+        const Cfg35& c = m.cfg;
+        const int TOP = c.top_k, MI = c.moe_inter, H = c.hidden;
+        std::vector<float> x((size_t)H);
+        for (int i = 0; i < H; i++) x[i] = (float)((i % 23) - 11) / 11.f;
+        CK(hipMemcpy(m.xb, x.data(), (size_t)H * 4, hipMemcpyHostToDevice));
+        std::vector<int> ids((size_t)TOP);
+        for (int k = 0; k < TOP; k++) ids[k] = (k * 31 + 7) % c.n_expert;
+        CK(hipMemcpy(m.ids_exp, ids.data(), (size_t)TOP * 4, hipMemcpyHostToDevice));
+        CK(hipDeviceSynchronize());
+        printf("gatherchk: ids=");
+        for (int k = 0; k < TOP; k++) printf("%d%s", ids[k], k + 1 < TOP ? "," : "");
+        printf("\n");
+
+        // ---- gate：gather（mode 0）+ 一次 GEMV  vs  逐专家 ----
+        const W8& wg = m.w8[m.Ls[0].gexp];
+        const int rows_gu = TOP * MI;
+        const int bpe_w = H / 2, bpe_s = (H / 128) * 2;
+        const size_t lo_q = (size_t)rows_gu * (H / 8), lo_s = (size_t)rows_gu * (H / 128);
+        float* ref = m.alloc(rows_gu);
+        float* got = m.alloc(rows_gu);
+        float* scr = m.alloc(std::max(rows_gu, H));
+        k_w4a8_quant(m.xb, H);
+        for (int k = 0; k < TOP; k++)
+            lin_q8(m, ref + (size_t)k * MI, m.Ls[0].gexp, m.xb, ids[k], 0);
+        k_gather_exp(m.stage_q, wg.hi, m.ids_exp, MI, bpe_w, 4, TOP, 0);
+        k_gather_exp(m.stage_q + lo_q, wg.lo, m.ids_exp, MI, bpe_w, 4, TOP, 0);
+        k_gather_exp(m.stage_s, (const void*)wg.shi, m.ids_exp, MI, bpe_s, 4, TOP, 0);
+        k_gather_exp(m.stage_s + lo_s, (const void*)wg.slo, m.ids_exp, MI, bpe_s, 4, TOP, 0);
+        k_w4a8_run1(got, m.stage_q, (const float*)m.stage_s, rows_gu, H, 0);
+        k_w4a8_run1(scr, m.stage_q + lo_q, (const float*)(m.stage_s + lo_s), rows_gu, H, 0);
+        k_add_inplace(got, scr, rows_gu);
+        CK(hipDeviceSynchronize());
+        {
+            std::vector<float> hr((size_t)rows_gu), hg((size_t)rows_gu);
+            CK(hipMemcpy(hr.data(), ref, hr.size() * 4, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(hg.data(), got, hg.size() * 4, hipMemcpyDeviceToHost));
+            double mx = 0, err = 0;
+            for (size_t i = 0; i < hr.size(); i++) {
+                mx = std::max(mx, (double)fabsf(hr[i]));
+                err = std::max(err, (double)fabsf(hr[i] - hg[i]));
+            }
+            printf("gatherchk gate[N=%d,K=%d] max|y|=%.4f  逐专家 vs gather max_abs=%.6f\n",
+                   rows_gu, H, mx, err);
+            printf("   ref[0..3]=%.5f %.5f %.5f %.5f\n", hr[0], hr[1], hr[2], hr[3]);
+            printf("   got[0..3]=%.5f %.5f %.5f %.5f\n", hg[0], hg[1], hg[2], hg[3]);
+            fflush(stdout);
+        }
+
+        // ---- down：mode 1（K 交织）vs 逐专家 ----
+        const W8& wd = m.w8[m.Ls[0].dexp];
+        const int Kd = TOP * MI;
+        {
+            std::vector<float> a((size_t)Kd);
+            for (int i = 0; i < Kd; i++) a[i] = (float)((i % 29) - 14) / 14.f;
+            CK(hipMemcpy(m.g8, a.data(), (size_t)Kd * 4, hipMemcpyHostToDevice));
+            k_fill(ref, 0.f, H);
+            k_w4a8_quant(m.g8, Kd);
+            for (int k = 0; k < TOP; k++) {
+                k_w4a8_run1(scr, (const u32*)((const uint8_t*)wd.hi + (size_t)ids[k] * H * (MI / 8) * 4),
+                            (const float*)((const uint8_t*)wd.shi + (size_t)ids[k] * H * (MI / 128) * 2),
+                            H, MI, (long long)k * MI);
+                k_add_inplace(ref, scr, H);
+            }
+            const size_t dlo_q = (size_t)H * (Kd / 8), dlo_s = (size_t)H * (Kd / 128);
+            k_gather_exp(m.stage_q, wd.hi, m.ids_exp, H, MI / 2, 4, TOP, 1);
+            k_gather_exp(m.stage_q + dlo_q, wd.lo, m.ids_exp, H, MI / 2, 4, TOP, 1);
+            k_gather_exp(m.stage_s, (const void*)wd.shi, m.ids_exp, H, (MI / 128) * 2, 2, TOP, 1);
+            k_gather_exp(m.stage_s + dlo_s, (const void*)wd.slo, m.ids_exp, H,
+                         (MI / 128) * 2, 2, TOP, 1);
+            k_w4a8_run1(got, m.stage_q, (const float*)m.stage_s, H, Kd, 0);
+            k_w4a8_run1(scr, m.stage_q + dlo_q, (const float*)(m.stage_s + dlo_s), H, Kd, 0);
+            k_add_inplace(got, scr, H);
+            CK(hipDeviceSynchronize());
+            std::vector<float> hr((size_t)H), hg((size_t)H);
+            CK(hipMemcpy(hr.data(), ref, hr.size() * 4, hipMemcpyDeviceToHost));
+            CK(hipMemcpy(hg.data(), got, hg.size() * 4, hipMemcpyDeviceToHost));
+            double mx = 0, err = 0;
+            for (size_t i = 0; i < hr.size(); i++) {
+                mx = std::max(mx, (double)fabsf(hr[i]));
+                err = std::max(err, (double)fabsf(hr[i] - hg[i]));
+            }
+            printf("gatherchk down[N=%d,K'=%d] max|y|=%.4f  逐专家 vs gather max_abs=%.6f\n",
+                   H, Kd, mx, err);
+            printf("   ref[0..3]=%.5f %.5f %.5f %.5f\n", hr[0], hr[1], hr[2], hr[3]);
+            printf("   got[0..3]=%.5f %.5f %.5f %.5f\n", hg[0], hg[1], hg[2], hg[3]);
+        }
+        fflush(stdout);
         return 0;
     }
     if (getenv("RT_Q36_LINCHK")) {

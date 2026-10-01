@@ -855,3 +855,16 @@ void k_int4_gemv(float* y, const uint32_t* wp, const unsigned short* ws, float* 
     }
     CK(hipGetLastError());
 }
+
+// ======================= 专家权重 gather（MoE 解码）=======================
+// 内核见 kernels/asm/k_moe/gather_exp_k.s：把「按专家散落」的权重行搬成连续暂存，
+// 这样现役 W4A8 GEMV 一次就能算完 8 个专家（详见该 .s 顶部注释）。
+__global__ void gather_exp_k(void* dst, const void* src, const uint32_t* tab,
+                             int rows, int bpe, int cshift, int nslot, int mode);
+void k_gather_exp(void* dst, const void* src, const uint32_t* tab, int rows, int bpe,
+                  int cshift, int nslot, int mode) {
+    const int chunks = bpe >> cshift;
+    gather_exp_k<<<dim3((chunks + 63) / 64, rows, nslot), 64>>>(
+        dst, src, tab, rows, bpe, cshift, nslot, mode);
+    CK(hipGetLastError());
+}

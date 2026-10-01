@@ -123,6 +123,10 @@ void k_gather_heads(float* dst, const float* src, int T, int n_head, int D,
 void k_scatter_heads(float* dst, const float* src, int T, int n_head, int D,
                      int tok_stride, int head_off, int src_rows);
 void k_scale(float* x, float s, long long n);
+// 专家权重 gather（MoE 解码）：把散落的专家行搬成连续暂存，供一次 GEMV 用。
+// mode 0 = 按行堆叠（gate/up）；mode 1 = K 方向交织（down 的 Σ_e W_e·x_e）。
+void k_gather_exp(void* dst, const void* src, const uint32_t* tab, int rows, int bpe,
+                  int cshift, int nslot, int mode);
 void k_rmsnorm_gated(float* y, const float* x, const float* w, const float* g, int rows, int D,
                      float eps);
 void k_split_qkv(float* q, float* k, float* v, const float* c, int T, int qn, int kn, int vn);
