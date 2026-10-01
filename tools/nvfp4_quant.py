@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nvfp4_ref as R                                    # E2M1 / E4M3 真值表
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_ST = '/home/t/桌面/Qwen3.8-27B-NVFP4/model.safetensors'
+DEFAULT_ST = os.path.join(ROOT, 'models/Qwen3.8-27B-NVFP4/model.safetensors')
 GROUP = 16
 E2M1_MAG = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 # 相邻格点的中点：|q| 落在哪一段就取哪个码（0.25 是 0 与 0.5 的中点）

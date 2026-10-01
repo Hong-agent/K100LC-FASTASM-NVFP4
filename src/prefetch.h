@@ -68,6 +68,7 @@ public:
         // 这里统一按组排一遍；不排的话后 add 进来的那些永远轮不到加载。
         std::stable_sort(items.begin(), items.end(),
                          [](const Item& a, const Item& b) { return a.group < b.group; });
+        for (const Item& it : items) ngroups = std::max(ngroups, it.group + 1);
         if (getenv("RT_PREFETCH") && atoi(getenv("RT_PREFETCH")) == 0) {
             sync_load();
             return;
@@ -104,24 +105,43 @@ private:
         const double t0 = now();
         int bi = 0;
         if (linear) {
-            size_t done = 0, gi = 0;
-            while (done < lin_bytes) {
-                PF_CK(hipEventSynchronize(buf_ev[bi]));
-                const size_t n = std::min(CHUNK, lin_bytes - done);
-                const size_t na = (n + 4095) & ~(size_t)4095;      // O_DIRECT: 长度按 4K 向上取
-                const ssize_t got = pread(fds[0], pin[bi], na, (off_t)(lin_base + done));
-                if (got < (ssize_t)n) {
-                    printf("prefetch(linear): pread off=%zu n=%zu got=%zd\n", done, na, got);
-                    exit(1);
+            // 线性载荷（.rp4）按组推进；**每组收尾前**先把这一组里额外登记的张量
+            //（例如 K100LC-kernels 的原生 int4 权重）也搬进来，最后才记这一组的事件。
+            // 原实现这里搬完线性载荷就直接 return，附加的 items 一个都不会加载，
+            // 于是 wait_group(g) 在数据还没到的时候就放行 —— 内核读到未初始化显存。
+            size_t done = 0, gi = 0, ii = 0;
+            while (gi < lin_groups.size()) {
+                const int g = lin_groups[gi].first;
+                const size_t end = lin_groups[gi].second;
+                while (done < end) {
+                    PF_CK(hipEventSynchronize(buf_ev[bi]));
+                    const size_t n = std::min(CHUNK, end - done);
+                    const size_t na = (n + 4095) & ~(size_t)4095;   // O_DIRECT: 长度按 4K 向上取
+                    const ssize_t got = pread(fds[0], pin[bi], na, (off_t)(lin_base + done));
+                    if (got < (ssize_t)n) {
+                        printf("prefetch(linear): pread off=%zu n=%zu got=%zd\n", done, na, got);
+                        exit(1);
+                    }
+                    PF_CK(hipMemcpyAsync(lin_dst + done, pin[bi], n,
+                                         hipMemcpyHostToDevice, load_stream));
+                    PF_CK(hipEventRecord(buf_ev[bi], load_stream));
+                    done += n;
+                    bi = (bi + 1) % NBUF;
                 }
-                PF_CK(hipMemcpyAsync(lin_dst + done, pin[bi], n, hipMemcpyHostToDevice, load_stream));
-                PF_CK(hipEventRecord(buf_ev[bi], load_stream));
-                done += n;
-                bi = (bi + 1) % NBUF;
-                while (gi < lin_groups.size() && lin_groups[gi].second <= done) {
-                    PF_CK(hipEventRecord(grp_ev[lin_groups[gi].first], load_stream));
-                    ready.store(lin_groups[gi].first + 1, std::memory_order_release);
-                    gi++;
+                while (ii < items.size() && items[ii].group <= g)
+                    copy_item(items[ii++], bi);
+                PF_CK(hipEventRecord(grp_ev[g], load_stream));
+                ready.store(g + 1, std::memory_order_release);
+                gi++;
+            }
+            // 组号比 .rp4 最后一组还大的 items（正常不会出现，兜底别漏搬）
+            while (ii < items.size()) {
+                const int g = items[ii].group;
+                while (ii < items.size() && items[ii].group == g)
+                    copy_item(items[ii++], bi);
+                if (g >= 0 && g < (int)grp_ev.size()) {
+                    PF_CK(hipEventRecord(grp_ev[g], load_stream));
+                    ready.store(g + 1, std::memory_order_release);
                 }
             }
             PF_CK(hipStreamSynchronize(load_stream));
@@ -132,21 +152,7 @@ private:
         size_t i = 0;
         for (int g = 0; g < ngroups; g++) {
             while (i < items.size() && items[i].group == g) {
-                const Item& it = items[i++];
-                size_t done = 0;
-                while (done < it.bytes) {
-                    PF_CK(hipEventSynchronize(buf_ev[bi]));       // 这个缓冲上次的拷贝完了吗
-                    const size_t n = std::min(CHUNK, it.bytes - done);
-                    const ssize_t got = pread(fds[it.file], pin[bi], n, (off_t)(it.off + done));
-                    if (got != (ssize_t)n) {
-                        printf("prefetch: pread 失败 off=%zu n=%zu got=%zd\n", it.off + done, n, got);
-                        exit(1);
-                    }
-                    PF_CK(hipMemcpyAsync(it.dst + done, pin[bi], n, hipMemcpyHostToDevice, load_stream));
-                    PF_CK(hipEventRecord(buf_ev[bi], load_stream));
-                    done += n;
-                    bi = (bi + 1) % NBUF;
-                }
+                copy_item(items[i++], bi);
             }
             PF_CK(hipEventRecord(grp_ev[g], load_stream));
             ready.store(g + 1, std::memory_order_release);
@@ -160,6 +166,17 @@ private:
     void sync_load() {
         std::vector<uint8_t> buf(CHUNK);
         const double t0 = now();
+        // 线性载荷（.rp4）也要搬：原来只搬 items，.rp4 模式下会整份漏掉
+        if (linear) {
+            size_t done = 0;
+            while (done < lin_bytes) {
+                const size_t n = std::min(CHUNK, lin_bytes - done);
+                const ssize_t got = pread(fds[0], buf.data(), n, (off_t)(lin_base + done));
+                if (got != (ssize_t)n) { printf("prefetch(linear): pread 失败\n"); exit(1); }
+                PF_CK(hipMemcpy(lin_dst + done, buf.data(), n, hipMemcpyHostToDevice));
+                done += n;
+            }
+        }
         for (const Item& it : items) {
             size_t done = 0;
             while (done < it.bytes) {
@@ -172,6 +189,24 @@ private:
         }
         secs = now() - t0;
         done_flag = true;
+    }
+
+    // 把一个登记项从文件搬进显存（分块 + page-locked 缓冲 + 异步拷贝）
+    void copy_item(const Item& it, int& bi) {
+        size_t done = 0;
+        while (done < it.bytes) {
+            PF_CK(hipEventSynchronize(buf_ev[bi]));       // 这个缓冲上次的拷贝完了吗
+            const size_t n = std::min(CHUNK, it.bytes - done);
+            const ssize_t got = pread(fds[it.file], pin[bi], n, (off_t)(it.off + done));
+            if (got != (ssize_t)n) {
+                printf("prefetch: pread 失败 off=%zu n=%zu got=%zd\n", it.off + done, n, got);
+                exit(1);
+            }
+            PF_CK(hipMemcpyAsync(it.dst + done, pin[bi], n, hipMemcpyHostToDevice, load_stream));
+            PF_CK(hipEventRecord(buf_ev[bi], load_stream));
+            done += n;
+            bi = (bi + 1) % NBUF;
+        }
     }
 
     static double now() {

@@ -123,3 +123,9 @@ void k_scale(float* x, float s, long long n);
 void k_rmsnorm_gated(float* y, const float* x, const float* w, const float* g, int rows, int D,
                      float eps);
 void k_split_qkv(float* q, float* k, float* v, const float* c, int T, int qn, int kn, int vn);
+
+// ---------------- 原生 compressed-tensors INT4（K100LC-kernels 的 int4_dot_k）---------
+// 权重直接用 checkpoint 的 weight_packed（I32，8 个 4bit 码/字）+ weight_scale（BF16，
+// 每 128 个 k 一个）：y[rows][N] = W[N][K] · x[rows][K]。partial 是 [N*K/128] 暂存。
+void k_int4_gemv(float* y, const uint32_t* wp, const unsigned short* ws, float* partial,
+                 const float* x, int rows, int N, int K);

@@ -1,5 +1,7 @@
 #!/bin/bash
-# 把本机已有的权重接到项目里（不下载、不复制大文件，一律软链接）。
+# 把本机已有的权重接进项目里（不下载）。**项目内不留软链接**：
+#   小文件直接复制；大于 1GB 的权重优先硬链接（同一文件系统、不额外占空间，
+#   删掉项目外的源目录也不影响），跨盘时退回复制。
 #
 #   bash scripts/setup_models.sh
 #   MODEL_SRC=/path/to/Qwen3.8-27B-INT4 \
@@ -20,7 +22,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKTOP="$(cd "$ROOT/.." && pwd)"
 
-# 把一个源目录接成一个模型目录：小文件软链，rt4 目录与 model.rp4 也软链。
+# 落成项目内真实文件：>1GB 优先硬链接（同盘不占额外空间），否则复制。
+install_file() {   # $1=源 $2=目标
+  local src="$1" dst="$2"
+  [ -r "$src" ] || return 0
+  mkdir -p "$(dirname "$dst")"
+  if [ "$(stat -L -c %s "$src")" -ge 1073741824 ]; then
+    if ln -f "$src" "$dst" 2>/dev/null; then return 0; fi
+  fi
+  cp --remove-destination -p "$src" "$dst"
+}
+
+# 把一个源目录接成一个模型目录（目录里全是项目内真实文件，没有软链接）。
 link_model() {   # $1=源目录 $2=目标模型目录 $3=rp4（可空） $4=rt4 目录（可空）
   local src="$1" dst="$2" rp4="$3" rt4_dir="$4" f
   mkdir -p "$dst"
@@ -30,11 +43,15 @@ link_model() {   # $1=源目录 $2=目标模型目录 $3=rp4（可空） $4=rt4 
              processor_config.json recipe.yaml vocab.json chat_template.jinja \
              model.safetensors model_mtp.safetensors model.safetensors.index.json; do
       [ -e "$src/$f" ] || continue
-      ln -sfn "$src/$f" "$f"
+      install_file "$src/$f" "$dst/$f"
     done
   )
   if [ -n "$rt4_dir" ] && [ -d "$rt4_dir" ]; then
-    ln -sfn "$(cd "$rt4_dir" && pwd)" "$dst/rt4"
+    mkdir -p "$dst/rt4"
+    for f in "$rt4_dir"/*; do
+      [ -f "$f" ] || continue
+      install_file "$f" "$dst/rt4/$(basename "$f")"
+    done
     echo "  rt4 : $rt4_dir"
   elif [ -d "$dst/rt4" ]; then
     echo "  rt4 : 已就位（$dst/rt4）"
@@ -42,7 +59,7 @@ link_model() {   # $1=源目录 $2=目标模型目录 $3=rp4（可空） $4=rt4 
     echo "  rt4 : 缺失 —— 跑一次转换：bash scripts/convert_weights.sh" >&2
   fi
   if [ -n "$rp4" ] && [ -r "$rp4" ]; then
-    ln -sfn "$(readlink -f "$rp4")" "$dst/model.rp4"
+    install_file "$(readlink -f "$rp4")" "$dst/model.rp4"
     echo "  rp4 : $(readlink -f "$rp4")"
   elif [ -r "$dst/model.rp4" ]; then
     echo "  rp4 : 已就位（$dst/model.rp4）"

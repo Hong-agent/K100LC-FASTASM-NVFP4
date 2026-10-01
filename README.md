@@ -28,9 +28,9 @@ RT4 int4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网�
 
 ## 一句话
 
-> 80 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于原 DTK 编译产物
-> （NVFP4 GEMM 另有一个「精确形状」变体槽，共 81 个）；
-> 打成一个 371,896 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
+> 119 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于 K100LC-kernels 包内的
+> 预编译产物（81 个 FASTASM 基线 + 38 个自研）；
+> 打成一个 632,920 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
 > **0**）。默认的 int4 主模型走 RT4 W4A8（int4 权重 × int8 激活），不做 NVFP4
 > 替换；打开 `NVFP4_ALL=mlp|all` 才有 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
 > 原样（权重零误差），其余 233 个（注意力/线性注意力投影、lm_head、56~63 层 MLP）
@@ -57,16 +57,20 @@ bash serve.sh --stop
 > `run.sh` / `serve.sh` 找不到 `build/rt` 时会自动用 `prebuilt/rt`。
 > `build.sh` 只在你要重新生成内核机器码或改内核时才需要（那时才要主机 `g++`）。
 
-> **默认打包布局**（`bash scripts/pack_weights.sh`）：默认源是 `models/Qwen3.8-27B-INT4`，
-> 产物 `build/model-int4.rp4`（软链成 `models/Qwen3.8-27B-INT4/model.rp4`）；
-> 主模型用 RT4 的 **int4 权重
-> （W4A8：int4 权重 × int8 激活）**，不做 NVFP4 替换；MTP 头用 **int8
-> （W8A8：`.hi`/`.lo` 两张 int4 跑两遍相加）**；视觉塔**不装进 `.rp4`**——
-> 引擎直接从 `rt4/qwen38_27b_vision.rt4` 单独加载、27 层在 DCU 上跑
-> （`RT_VISION_DEVICE=gpu`，默认）；想换成 `scripts/vision_cpu.py` 的纯 CPU
-> 编码器就设 `RT_VISION_DEVICE=cpu`。
-> NVFP4 直跑改成显式 opt-in：`NVFP4_ALL=mlp`（168 个 MLP）或 `NVFP4_ALL=all`
-> （401 个线性层）；要把视觉塔放回 `.rp4`：`VISION_RP4=1`。
+> **默认精度 = 全 W4A8**（大模型 / MTP / 视觉塔都是 int4 权重 × int8 激活）。
+> 默认不走 `.rp4`、不走 NVFP4、不走原生 W4A16、不走 W4A4：引擎直接读
+> `models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4`（主模型）、`qwen38_27b_mtp.rt4`
+> （MTP）、`qwen38_27b_vision.rt4`（视觉塔，27 层在 DCU 上跑）。这些开关都在
+> `scripts/env.sh`：`RT_NVFP4=0 / RT_RP4=0 / RT_INT4_NATIVE=0 / RT_ACT4=0 /
+> RT_MTP_W8=0 / RT_VISION_DEVICE=gpu`。
+>
+> `.rp4` 单文件与 NVFP4 直跑保留为 opt-in：`bash scripts/pack_weights.sh` 打
+> `build/model-int4.rp4`（默认也是 W4A8 主模型 + int4 MTP），`NVFP4_ALL=mlp|all`
+> 才开 NVFP4；要把视觉塔装进 `.rp4`：`VISION_RP4=1`；想回 int8 MTP：`MTP_W8=1`。
+>
+> **项目内没有软链接**：`models/` 下的权重都是项目内真实文件（大文件用硬链接落盘，
+> 同盘不额外占空间，删掉项目外的源目录也不影响）。`scripts/setup_models.sh` /
+> `scripts/pack_weights.sh` 也不会再生成软链接。
 
 ## 默认模型与切换
 
@@ -75,7 +79,7 @@ bash serve.sh --stop
 
 | 入口 | 默认行为 |
 |---|---|
-| `bash serve.sh` | 起网页 + `/v1`，模型名 `qwen38-fastasm-int4`，权重 `build/model-int4.rp4` |
+| `bash serve.sh` | 起网页 + `/v1`，模型名 `qwen38-fastasm-int4`，**默认全 W4A8**（直接读 `rt4/` 下的 .rt4，不走 `.rp4`） |
 | `bash run.sh` | 命令行对话，RT4 取 `models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4` |
 | `bash scripts/fetch_model.sh` | 从魔搭拉 int4 checkpoint（`VARIANT=nvfp4` 换 NVFP4 那份） |
 | `bash scripts/convert_weights.sh` | 转换 `RT_MODEL_DIR` 里那份（默认 int4） |
@@ -91,6 +95,78 @@ RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh
 
 再打开 NVFP4 直跑：`NVFP4_ALL=mlp|all bash scripts/pack_weights.sh`（见下文的打包说明）。
 `serve-int4.sh` 仍保留，但已经是 `PORT=8080 bash serve.sh` 的薄别名。
+
+### 全 W4A8 启动（**项目默认**，大模型 / MTP / 视觉塔）
+
+```bash
+bash serve.sh                   # http://<本机IP>/（80）；PORT=8081 可换端口
+bash serve.sh --stop
+# serve-w4a8.sh 是同一入口的兼容别名
+```
+
+三个部分都走「**int4 权重 × int8 激活**」，不碰 NVFP4 / 原生 W4A16 / W4A4：
+
+| 部分 | 权重 | 运行时 |
+|---|---|---|
+| 大模型 | `rt4/qwen38_27b.rt4`（i4/128） | `RT_INT4_NATIVE=0` 关掉 checkpoint 原生 W4A16，解码 GEMV + 预填充 GEMM 都走 W4A8 |
+| MTP | `rt4/qwen38_27b_mtp.rt4`（i4/128，15 张量） | 和主模型同一套 W4A8 内核；`RT_MTP_W8=0` 明确不要 W8A8 的 `.hi/.lo` 版本 |
+| 视觉塔 | `rt4/qwen38_27b_vision.rt4`（i4/128，333 张量） | `RT_VISION_DEVICE=gpu`，线性层复用 W4A8 GEMV/GEMM，norm/bias/pos 仍是 f32 |
+
+视觉权重由 `tools/convert_vision_rt4.py` 生成，**默认 int4**（`--f16` 可退回旧
+f16 版本）。同一张图 48 token：int4 77.5 ms vs f16 157.6 ms（约 2 倍），
+embedding 与 f16 的余弦相似度均值 0.977（最低 0.918）。
+
+### 原生 int4 直跑（K100LC-kernels 的 `int4_dot_k`，opt-in）
+
+线性层的**解码路径**可以直接吃 checkpoint 的原始 int4 字节（`weight_packed`
+I32 + `weight_scale` BF16），不经过 `tools/convert.c` 的重量化 —— 内核来自
+`K100LC-kernels` 包（`int4_dot_k` + `reduce_blocks_k`，W4A16：激活保持 f32）。
+**默认关闭**（`RT_INT4_NATIVE=0`，项目默认走 W4A8）；要用就显式打开：
+
+```bash
+python3 /home/t/桌面/K100LC-kernels/tools/int4_engine_manifest.py \
+        -o build/int4_manifest.tsv      # 400 层权重清单（文件偏移 + 字节数自检）
+python3 tools/sync_kernels.py           # 同步 K100LC-kernels 的全部内核（119 个）
+bash build.sh                           # 重新汇编（119 个内核）并编出 build/rt
+RT_INT4_NATIVE=1 PORT=8080 bash serve.sh  # 网页 + /v1，日志里会出现「INT4 原生：400 个线性层…」
+```
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `RT_INT4_NATIVE` | `0` | 1 = 打开原生 W4A16 解码（默认关，走 RT4 W4A8） |
+| `RT_INT4_PREFILL` | `0` | 1 = 预填充也走原生（逐 token，慢）；默认预填充仍用 RT4 的 W4A8 GEMM |
+| `MTP_N` | 原生路径下 `0` | 原生解码下 MTP 的验证批要按行重读权重，实测更慢（6.9 vs 10.1 tok/s） |
+
+实测（本机，无 MTP）：原生解码 **10.1 tok/s**，RT4/W4A8 基线 22.3 tok/s —— 慢 2.2 倍，
+换来的是权重零误差 + f32 激活（A16）。格式、ABI、逐层带宽与对账见
+`K100LC-kernels/docs/INT4.md`。
+
+### 内核支持：与 K100LC-kernels 包同步（119 个内核）
+
+项目的内核构建现在与可复用内核包 **K100LC-kernels v1.0.0 完全对齐**：
+`kernels/kernel_spec.json` + `kernels/asm/**` 共 **119 个内核**（81 个 FASTASM
+基线 + 38 个自研），`bash build.sh` 汇编出的 `build/k100lc_all.hsaco`
+（632,920 B）与包内 `prebuilt/k100lc_kernels.hsaco` **逐字节一致**。
+
+```bash
+python3 tools/sync_kernels.py --check        # 只报告差多少
+python3 tools/sync_kernels.py                # 把缺的内核同步进来（默认不覆盖同名）
+python3 tools/sync_kernels.py --refresh      # 同名内核也用包里的版本覆盖
+bash build.sh                                # 重新汇编 119 个内核
+bash tests/test_all_kernels_hsaco.sh         # 逐个解析全部内核符号并跑通
+```
+
+同步进来的自研内核按用途：
+
+| 类别 | 内核 |
+|---|---|
+| RT4 / INT4 主通路 | `int4_dot_k`、`reduce_blocks_k`、`int4_dequant_k`、`quant_rows_fast_k`、`gemm_w4a4_flat` |
+| W4A4 / W4A8 GEMV | `gemv_w4a4_r2_k`、`gemv_w4a4_r2_m3_k`、`gemv_i8_k`、`gemv_f32_k`、`gemv_f32_warp_k` |
+| GGUF 原生解码/点积 | `q2_0/q4_0/q8_0/iq4nl/iq4xs/iq2s/iq3s/iq3xxs/q4k/q5k/q6k` 的 `*_dequant_k` / `*_dot_k` |
+| 通用算子 | `gelu_mul_k`、`softmax_k`、`layernorm_k`、`topk_k`、`router_top10_k`、`iq4nl_to_i8_k` |
+
+项目里已经在用的还是原来的 59 个；其余内核在 HSACO 里可用，需要时按
+`K100LC-kernels/docs/ABI.md` 的参数表启动即可。
 
 **结论：NVFP4 直跑是备用选项，不是推荐配置。** 理由是实测不划算（同一台 K100_LC、
 `scripts/bench.sh` 默认档 8192 token 预填充 / 500 token 生成）：
@@ -158,8 +234,8 @@ RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 
 | 环节 | 结果 |
 |---|---|
-| 自研汇编器 | 80/80 个模型内核从 `.s` 汇编，**逐字节等于原 DTK 编译产物**（207,296 B）+ 1 个手工变体（NVFP4 GEMM 精确形状槽） |
-| 自研 HSACO | 单文件 **371,896 B**，含 81 个内核；HSA 解析全部符号并执行 |
+| 自研汇编器 | 119 个内核全部从 `.s` 汇编；与 K100LC-kernels 包内预编译 `.bin` **逐字节一致** |
+| 自研 HSACO | 单文件 **632,920 B**，含 119 个内核；HSA 解析全部符号并执行 |
 | 运行时依赖 | `build/rt` 只链接 **libhsa-runtime64.so.1**；DTK 库引用 **0** |
 | 默认模型 | `RedHatAI/Qwen3.8-27B-INT4` → RT4 int4（W4A8）；主模型 851 张量 = 402 int4 + 353 f32 + 96 f16 |
 | 模型加载（默认） | int4 路线的 `.rp4` 单文件 **14.351 GB**，874 张量（main 851 / MTP 23），视觉塔不装进去 |
@@ -177,14 +253,14 @@ RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 | 路径 | 内容 |
 |---|---|
 | `asm.py`、`encodings.json` | **自研表驱动汇编器**与指令编码表（424+ 个编码形式） |
-| `kernels/asm/` | 80 个内核的 `.s` 源码 + 1 个手工变体（自研汇编器语法） |
+| `kernels/asm/` | 119 个内核的 `.s` 源码（基线 + 自研；`k_pkg/` 是从 K100LC-kernels 同步来的） |
 | `kernels/kernel_spec.json` | 每个内核的参数表、kernarg/段大小、SGPR/VGPR 计数 |
 | `kernels/kv_pack.h` 等 | 内核共用常量与 RT4 内核头 |
 | `kernels/nvfp4/`、`include/nvfp4/` | **NVFP4** 解码 GEMV / GEMM 内核与 FP4→int8 原语 |
 | `runtime/hsa_rt.{h,cpp}` | **无 DTK 运行时**：HSA 队列、投递、内存、同步的 HIP 兼容垫片 |
 | `src/model.cpp`、`src/k_*.hip` | 模型与内核启动代码（host 侧由 `tools/gen_nodtk.py` 自动改写） |
 | `web/index.html`、`web/style.css` | 网页控制台（从 K100LC-RT4 搬入本项目） |
-| `models/Qwen3.8-27B-INT4/` | **默认权重目录**（软链，不随仓库发布）：RT4 int4 主模型 + int8 MTP + 视觉塔 + `model.rp4`；NVFP4 checkpoint 在 `models/Qwen3.8-27B-NVFP4/`（opt-in） |
+| `models/Qwen3.8-27B-INT4/` | **默认权重目录**（项目内真实文件，无软链接）：RT4 int4 主模型 + int4 MTP + int4 视觉塔 + `model.rp4`；NVFP4 checkpoint 在 `models/Qwen3.8-27B-NVFP4/`（opt-in） |
 | `scripts/serve.py` | OpenAI 兼容服务 + 静态网页 + 附件/视觉（后端 = 本项目 `build/rt`） |
 | `scripts/chat.py` | 命令行对话 |
 | `scripts/deploy_online.sh`、`scripts/fetch_model.sh` | 联网从零部署一条龙 / 拉源模型（断点续传） |

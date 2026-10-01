@@ -1,12 +1,15 @@
 #!/bin/bash
 # 启动网页控制台 + OpenAI 兼容接口（网页来自 K100LC-RT4/web，后端是本项目的 build/rt）。
-# **默认模型 = Qwen3.8-27B-INT4**（models/Qwen3.8-27B-INT4，单文件 build/model-int4.rp4）。
+# **默认 = 全 W4A8**：大模型 / MTP / 视觉塔都是 int4 权重 × int8 激活，
+# 权重直接用 models/Qwen3.8-27B-INT4/rt4 下的 .rt4（不走 .rp4 / NVFP4 / W4A16）。
+# 这三个默认值在 scripts/env.sh 里（RT_NVFP4=0 / RT_RP4=0 / RT_INT4_NATIVE=0 /
+# RT_ACT4=0 / RT_MTP_W8=0 / RT_VISION_DEVICE=gpu），需要旧路线就显式覆盖。
 #
 #   bash serve.sh                         # 默认 http://<本机IP>/（监听 80，不带端口号）
 #   PORT=8080 CTX=40960 MTP_N=0 bash serve.sh
 #   bash serve.sh --stop
 #
-# 换成 NVFP4 checkpoint（opt-in）：
+# 换成 NVFP4 checkpoint（opt-in，会覆盖默认的 W4A8 设置）：
 #   RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RT_RP4=build/model.rp4 bash serve.sh
 #
 # 前端引擎是 build/rt：自研汇编器产出的 HSACO + /opt/hyhal 的 HSA 直跑，
@@ -19,7 +22,12 @@ cd "$RT_ROOT"
 # 默认监听 80，这样局域网里直接访问 http://<本机IP>/ 就行（不用带端口号）。
 PORT="${PORT:-80}"
 CTX="${CTX:-40960}"
-MTP_N="${MTP_N:-3}"
+# MTP 草稿数的默认值：默认路线是 RT4 W4A8（RT_INT4_NATIVE=0），MTP 划算 → 默认 3。
+# 若手动开回原生 int4（RT_INT4_NATIVE=1，W4A16），验证批要按行重读权重
+# （4 行 = 4 遍），实测 6.9 tok/s 反而低于无 MTP 的 10.1 tok/s → 那种配置下默认关。
+if [ -z "${MTP_N:-}" ]; then
+  if [ "${RT_INT4_NATIVE:-1}" = "0" ]; then MTP_N=3; else MTP_N=0; fi
+fi
 PIDFILE="$RT_ROOT/build/serve.pid"
 LOGFILE="$RT_ROOT/build/serve.log"
 NO_MTP_FLAG=""
@@ -61,10 +69,17 @@ if [ ! -r "$RT_MODEL_DIR/tokenizer.json" ]; then
   echo "先跑：bash scripts/setup_models.sh" >&2
   exit 1
 fi
-if [ ! -r "$RT_RP4" ]; then
-  echo "缺少权重 $RT_RP4" >&2
-  echo "  默认模型是 int4：先跑 bash scripts/convert_weights.sh && bash scripts/pack_weights.sh" >&2
-  exit 1
+# 权重来源二选一：.rp4 单文件，或直接给 --model/--json 的 .rt4（如 GGUF 转出来的）。
+# RT_RP4=0 表示显式关闭 .rp4 单文件模式（serve.py / 引擎都认这个约定）。
+if [ "${RT_RP4:-}" = "0" ] || [ ! -r "${RT_RP4:-}" ]; then
+  if [ -r "${RT_RT4:-}" ] && [ -r "${RT_RT4_JSON:-}" ]; then
+    echo "  （无 .rp4，直接用 RT4：$RT_RT4）"
+    export RT_RP4=0
+  else
+    echo "缺少权重 ${RT_RP4:-（未设置）}" >&2
+    echo "  默认模型是 int4：先跑 bash scripts/convert_weights.sh && bash scripts/pack_weights.sh" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$RT_ROOT/build"

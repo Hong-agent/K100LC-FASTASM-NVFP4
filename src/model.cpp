@@ -469,16 +469,28 @@ struct Wq {                       // 一个 int4 权重矩阵
     const uint8_t* nvs = nullptr; // weight_scale  [N][K/16] u8 (E4M3)
     float nvgs = 1.f;             // weight_global_scale
     bool has_nvfp4() const { return nvp != nullptr; }
+    // 可选：这份权重还有一份**原生 compressed-tensors INT4**（checkpoint 原字节，
+    // 不转换、不重量化）：weight_packed I32 [N][K/8] + weight_scale BF16 [N][K/128]。
+    // 清单由 K100LC-kernels 的 tools/int4_engine_manifest.py 生成。
+    // 非空时解码/小批直接走那边的 int4_dot_k（W4A16：激活不量化）。
+    const u32* i4p = nullptr;
+    const unsigned short* i4s = nullptr;
+    bool has_int4() const { return i4p != nullptr; }
 };
 struct Wf { const void* p = nullptr; int n = 0; bool is_f16 = false; };
 
 // ============================== 视觉塔（RT4） ==============================
-// 权重来自 tools/convert_vision_rt4.py：线性层 int4/128（N 补 64、K 补 128），
-// norm/bias/pos_embed 是 f32。线性层直接复用文本运行时的 int4 GEMM。
+// 权重来自 tools/convert_vision_rt4.py：线性层默认 int4/128（N 补 64、K 补 128，
+// W4A8：int4 权重 × int8 激活；--f16 可退回 f16），norm/bias/pos_embed 是 f32。
+// 线性层直接复用文本运行时的 W4A8 GEMV / GEMM。
 struct VisionModel {
     struct VW {
-        const uint16_t* w = nullptr;      // f16 [N,K]
-        int N = 0, K = 0;
+        const uint16_t* w = nullptr;   // f16 [N,K]
+        const u32* q = nullptr;        // int4 [N,K/2]（低半字节 = 偶数 k）
+        const uint16_t* s = nullptr;   // int4 行优先 f16 尺度 [N][K/group]
+        float* s_gm = nullptr;         // int4 组优先 f32 尺度（GEMM 用）
+        int N = 0, K = 0, group = 128;
+        bool i4 = false;
     };
     struct VLayer {
         VW qkv, proj, fc1, fc2;
@@ -512,6 +524,11 @@ struct VisionModel {
     float *d_cos = nullptr, *d_sin = nullptr, *d_merger = nullptr, *d_merger2 = nullptr;
     float *d_out = nullptr;
 
+    // int4/W4A8 的激活量化暂存（按最大 K/N/patch 数预留，只分配一次）
+    u32 *vaq_h = nullptr, *vaq_l = nullptr;
+    float *vasc = nullptr, *vasc16 = nullptr, *vc_tmp = nullptr;
+    int vk_max = 0, vn_max = 0;
+
     // pos/rope 表按 (gh,gw) 网格缓存：表内容只由网格决定（n=4*gh*gw 随之固定），
     // 同网格的图片直接复用设备上已上传的表 —— 主机重建 + 三次 H2D 全部省掉。
     // 上限 8 个网格，LRU 淘汰（淘汰只是删记录，设备缓冲会被新网格覆盖）。
@@ -521,17 +538,48 @@ struct VisionModel {
 
     static int align128(int n) { return (n + 127) / 128 * 128; }
 
+    static float h2f(uint16_t h) {
+        const uint32_t sg = (h >> 15) & 1, ex = (h >> 10) & 0x1F, ma = h & 0x3FF;
+        const float f = ex == 0 ? ldexpf(ma / 1024.f, -14)
+                                : ldexpf(1.f + ma / 1024.f, (int)ex - 15);
+        return sg ? -f : f;
+    }
+
     VW W(const std::string& name) {
         const RT4Tensor* t = rt.find(name);
-        if (!t || t->kind != "f16") {
-            printf("视觉权重缺失或不是 f16：%s\n", name.c_str());
-            exit(1);
-        }
+        if (!t) { printf("视觉权重缺失：%s\n", name.c_str()); exit(1); }
         VW w;
-        w.w = (const uint16_t*)rt.dptr(t);
         w.N = (int)t->N;
         w.K = (int)t->K;
+        w.group = (int)(t->group ? t->group : 128);
+        if (t->kind == "i4") {
+            w.i4 = true;
+            w.q = rt.qptr(t);
+            w.s = (const uint16_t*)rt.sptr(t);
+        } else if (t->kind == "f16") {
+            w.w = (const uint16_t*)rt.dptr(t);
+        } else {
+            printf("视觉权重 %s 的 kind=%s 不支持（需要 i4 或 f16）\n",
+                   name.c_str(), t->kind.c_str());
+            exit(1);
+        }
         return w;
+    }
+
+    // int4 权重的组优先 f32 尺度（GEMM 用），布局与文本侧 make_group_major 相同。
+    void make_gm(const std::string& name, VW& w) {
+        if (!w.i4) return;
+        const RT4Tensor* t = rt.find(name);
+        const int ng = w.K / w.group;
+        std::vector<float> out((size_t)w.N * ng);
+        const uint16_t* s = (const uint16_t*)rt.hptr(t->s_off);
+        for (int n = 0; n < w.N; n++)
+            for (int g = 0; g < ng; g++)
+                out[(size_t)g * w.N + n] = h2f(s[(size_t)n * ng + g]);
+        CK(hipMalloc(&w.s_gm, out.size() * 4));
+        CK(hipMemcpy(w.s_gm, out.data(), out.size() * 4, hipMemcpyHostToDevice));
+        vk_max = std::max(vk_max, w.K);
+        vn_max = std::max(vn_max, w.N);
     }
 
     const float* F(const std::string& name) {
@@ -576,6 +624,10 @@ struct VisionModel {
             L.proj = W(n("attn.proj.weight"));
             L.fc1 = W(n("mlp.linear_fc1.weight"));
             L.fc2 = W(n("mlp.linear_fc2.weight"));
+            make_gm(n("attn.qkv.weight"), L.qkv);
+            make_gm(n("attn.proj.weight"), L.proj);
+            make_gm(n("mlp.linear_fc1.weight"), L.fc1);
+            make_gm(n("mlp.linear_fc2.weight"), L.fc2);
             L.n1w = F(n("norm1.weight")); L.n1b = F(n("norm1.bias"));
             L.n2w = F(n("norm2.weight")); L.n2b = F(n("norm2.bias"));
             L.qkvb = F(n("attn.qkv.bias")); L.projb = F(n("attn.proj.bias"));
@@ -583,6 +635,9 @@ struct VisionModel {
         }
         m_fc1 = W("model.visual.merger.linear_fc1.weight");
         m_fc2 = W("model.visual.merger.linear_fc2.weight");
+        make_gm("model.visual.patch_embed.proj.weight", patch_w);
+        make_gm("model.visual.merger.linear_fc1.weight", m_fc1);
+        make_gm("model.visual.merger.linear_fc2.weight", m_fc2);
         m_nw = F("model.visual.merger.norm.weight");
         m_nb = F("model.visual.merger.norm.bias");
         m_fc1b = F("model.visual.merger.linear_fc1.bias");
@@ -601,6 +656,14 @@ struct VisionModel {
         CK(hipMalloc(&d_merger, (size_t)MMpad * MERGE_IN * 4));
         CK(hipMalloc(&d_merger2, (size_t)MMpad * MERGE_IN * 4));
         CK(hipMalloc(&d_out, (size_t)MMpad * OUT_H * 4));
+        if (vk_max > 0) {
+            // k_quant_rows_a8：每行 K/8 个 dword，尺度 [K/group][Mpad]（组优先）
+            CK(hipMalloc(&vaq_h, (size_t)Mpad * (vk_max / 8) * 4));
+            CK(hipMalloc(&vaq_l, (size_t)Mpad * (vk_max / 8) * 4));
+            CK(hipMalloc(&vasc, (size_t)(vk_max / 128) * Mpad * 4));
+            CK(hipMalloc(&vasc16, (size_t)(vk_max / 128) * Mpad * 4));
+            CK(hipMalloc(&vc_tmp, (size_t)Mpad * vn_max * 4));
+        }
         CK(hipMemset(d_patch, 0, (size_t)Mpad * PATCH_DIM * 4));
         CK(hipMemset(d_attn, 0, (size_t)Mpad * H * 4));
         CK(hipMemset(d_mlp, 0, (size_t)Mpad * INTER_PAD * 4));
@@ -614,7 +677,21 @@ struct VisionModel {
     }
 
     void linear_s(float* y, const VW& w, const float* x, int M, int x_stride) {
-        k_vit_linear_f16(y, w.w, x, M, w.N, w.K, x_stride, w.N);
+        if (!w.i4) {
+            k_vit_linear_f16(y, w.w, x, M, w.N, w.K, x_stride, w.N);
+            return;
+        }
+        // int4 权重 × int8 激活（W4A8）：小 M 走 GEMV，整图 patch 走 GEMM。
+        if (x_stride == 0) x_stride = w.K;
+        if (M <= 4 && x_stride == w.K) {
+            k_gemv_w4a8(y, w.q, (const float*)w.s, x, M, w.N, w.K);
+            return;
+        }
+        const int Mp = align128(M);          // GEMM 的 M 必须是 128 的整数倍
+        if (!w.s_gm) { printf("视觉 int4 权重组尺度未初始化\n"); exit(1); }
+        k_quant_rows_a8(vaq_h, vaq_l, vasc, vasc16, x, Mp, w.K, w.group, x_stride);
+        k_gemm_i4_a8(y, vc_tmp, w.q, w.s_gm, vaq_h, vaq_l, vasc, vasc16,
+                     Mp, w.N, w.K);
     }
 
     void dump_dev(const char* tag, const float* p, int rows, int D) {
@@ -873,6 +950,8 @@ struct Dev {
     float *mtp_e = nullptr, *mtp_hin = nullptr, *mtp_hn = nullptr, *mtp_cat = nullptr;
     float *mtp_fc = nullptr, *mtp_tmp = nullptr, *mtp_out = nullptr;
     float *mtp_logits = nullptr;
+    // 原生 int4（int4_dot_k）的 partial 暂存：最大一层 = down_proj 5120×136 = 696320 块
+    float *i4_partial = nullptr;
     // MTP 的 W8A8：lo 半边的 linear 输出（[T][17408]，MTP 里 N 最大的一层）
     float *mtp_lin2 = nullptr;
     // MTP 验证批的逐 token 状态快照（GDN / 卷积），以及逐行 logits
@@ -937,6 +1016,7 @@ void Dev::alloc(int T) {
     CK(hipMalloc(&logits_all, (size_t)4 * 248320 * 4));
     CK(hipMalloc(&argmax, 4 * sizeof(int)));
     CK(hipMalloc(&mtp_dids, (size_t)4 * sizeof(int) + 64));
+    CK(hipMalloc(&i4_partial, (size_t)1024 * 1024 * 4));      // 原生 int4 的 partial
 }
 
 // ============================== 模型 =======================================
@@ -1165,6 +1245,12 @@ struct NvRow { int layer, slot; size_t poff, pbytes, soff, sbytes; float gs; int
                std::string name;                    // 去掉 .weight_packed/.weight 的名字
 };
 
+// 原生 compressed-tensors INT4 的一行清单（同样是「名字 → (层号, 槽位)」）：
+// packed = weight_packed I32 [N][K/8]，scale = weight_scale BF16 [N][K/128]，
+// offset 都是 checkpoint 文件里的绝对字节偏移。见 read_int4_rows / attach_int4。
+struct I4Row { int layer, slot; size_t poff, pbytes, soff, sbytes; int N, K;
+               std::string name; };
+
 // 名字 → (层号, 槽位)。layer = -1 表示没有层号的全局权重（lm_head）。
 static bool nv_parse(const std::string& name, int* layer, int* slot) {
     *layer = -1;
@@ -1321,6 +1407,8 @@ struct Model {
                       const std::map<std::string, size_t>* nvp = nullptr,
                       const std::map<std::string, size_t>* nvs = nullptr,
                       uint8_t* dev = nullptr);
+    // 原生 compressed-tensors INT4（K100LC-kernels 的 int4_dot_k）：见实现处
+    void attach_int4(const std::vector<I4Row>& rows, Prefetch& pf, int file);
 };
 
 // 取权重（名字带上语言模型的完整前缀）
@@ -1362,6 +1450,74 @@ static std::set<std::string> nvfp4_skip_names(const std::vector<NvRow>& rows) {
     std::set<std::string> s;
     for (const NvRow& r : rows) s.insert(r.name + ".weight");
     return s;
+}
+
+// ==================== 原生 compressed-tensors INT4（W4A16）====================
+// checkpoint（RedHatAI/Qwen3.8-27B-INT4）里的 int4 线性层是
+//   weight_packed I32 [N][K/8]（8 个 4bit 码/字，低半字节 = 更小的 k，码 offset-binary）
+//   weight_scale  BF16[N][K/128]（每 128 个 k 一个尺度，无 global scale）
+// 本路线**直接读这些字节**，解码与点积交给 K100LC-kernels 的 int4_dot_k
+// （见该包的 docs/INT4.md）；没有任何转换或重量化。
+// 清单由那个包的 tools/int4_engine_manifest.py 生成：
+//   # name  packed_off  packed_bytes  scale_off  scale_bytes  N  K
+// safetensors 路径一起传进来：清单里记了源文件字节数，对不上（比如切到 NVFP4 那份
+// checkpoint）就整份作废 —— 偏移是文件绝对偏移，认错文件会读到完全不相干的数据。
+static std::vector<I4Row> read_int4_rows(const std::string& manifest, int n_layer,
+                                         const std::string& safetensors) {
+    std::vector<I4Row> rows;
+    std::ifstream mf(manifest);
+    if (!mf) return rows;
+    std::string line;
+    long long want = -1;
+    while (std::getline(mf, line)) {
+        if (line.rfind("# source", 0) == 0) { want = atoll(line.c_str() + 8); continue; }
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        I4Row r{};
+        ss >> r.name >> r.poff >> r.pbytes >> r.soff >> r.sbytes >> r.N >> r.K;
+        if (!ss) continue;
+        if (!nv_parse(r.name, &r.layer, &r.slot)) continue;   // 复用同一套名字 → 槽位解析
+        if (r.layer >= n_layer) continue;
+        rows.push_back(r);
+    }
+    if (!rows.empty() && want >= 0) {
+        struct stat st{};
+        if (stat(safetensors.c_str(), &st) != 0) return {};
+        if ((long long)st.st_size != want) {
+            printf("INT4 原生：清单 %s 对应的是 %lld 字节的 checkpoint，当前 %s 是 %lld 字节"
+                   " → 偏移对不上，本次不用原生 int4\n", manifest.c_str(), want,
+                   safetensors.c_str(), (long long)st.st_size);
+            return {};
+        }
+    }
+    return rows;
+}
+
+// 把原生 int4 权重挂到各线性层：每个张量各自 malloc，并登记进按层预取器
+//（和第 il 层一起搬），这样加载与计算重叠，第一次前向不用等整份权重。
+void Model::attach_int4(const std::vector<I4Row>& rows, Prefetch& pf, int file) {
+    size_t tot = 0;
+    int n = 0;
+    for (const I4Row& r : rows) {
+        Wq* w = wq_at(r.layer, r.slot);
+        if (!w) continue;
+        if (w->N != r.N || w->K != r.K) {
+            printf("INT4: 形状不符 %s: RT4 %dx%d vs 原生 %dx%d\n", r.name.c_str(),
+                   w->N, w->K, r.N, r.K);
+            exit(1);
+        }
+        void *dp = nullptr, *ds = nullptr;
+        CK(hipMalloc(&dp, r.pbytes));
+        CK(hipMalloc(&ds, r.sbytes));
+        pf.add(file, r.poff, dp, r.pbytes, 1 + r.layer);
+        pf.add(file, r.soff, ds, r.sbytes, 1 + r.layer);
+        w->i4p = (const u32*)dp;
+        w->i4s = (const unsigned short*)ds;
+        tot += r.pbytes + r.sbytes;
+        n++;
+    }
+    printf("INT4 原生：%d 个线性层直接吃 checkpoint 原字节（%.3f GB）——"
+           "解码/小批走 int4_dot_k（A16，不重量化）\n", n, tot / 1e9);
 }
 
 // 把 NVFP4 权重挂到对应的线性层上（MLP / 注意力 / 线性注意力 / lm_head）。
@@ -1692,6 +1848,28 @@ void Model::init(const std::string& path, const std::string& json) {
         }
     }
 
+    // ---- 原生 compressed-tensors INT4（opt-in，默认开）----
+    // 从 checkpoint 直接读 400 个线性层的 weight_packed/weight_scale，交给
+    // K100LC-kernels 的 int4_dot_k；权重不做任何转换或重量化。
+    // RT_INT4_NATIVE=0 关掉（回到纯 RT4 路线）。
+    if (getenv("RT_INT4_NATIVE") ? atoi(getenv("RT_INT4_NATIVE")) : 1) {
+        const char* mf = getenv("RT_INT4_MANIFEST");
+        const char* st = getenv("RT_INT4_SAFETENSORS");
+        std::string mfs = mf && *mf ? mf : "build/int4_manifest.tsv";
+        // 兜底也走项目内：默认模型目录下的 safetensors（scripts/env.sh 会设 RT_INT4_SAFETENSORS）
+        std::string sts = st && *st ? st : "models/Qwen3.8-27B-INT4/model.safetensors";
+        std::vector<I4Row> i4_rows = read_int4_rows(mfs, cfg.n_layer, sts);
+        if (i4_rows.empty()) {
+            printf("INT4 原生：清单 %s 不可用（空 / 打不开 / 与当前 checkpoint 不匹配），"
+                   "线性层仍走 RT4\n", mfs.c_str());
+        } else if (access(sts.c_str(), R_OK) != 0) {
+            printf("INT4 原生：读不到 %s，线性层仍走 RT4\n", sts.c_str());
+        } else {
+            const int f_i4 = pf.add_file(sts.c_str());
+            attach_int4(i4_rows, pf, f_i4);
+        }
+    }
+
     // ---- 激活缓冲 ----
     d.alloc(T_MAX);
 
@@ -1920,6 +2098,19 @@ void Model::reset_state() {
 // RT_ACT4=1 可以强制回退到纯 int4 激活（只用于性能对照）。
 void Model::linear_quant(float* y, const Wq& w, const float* x, int M,
                          u32* aq, float* asc, int row_stride, int row_off) {
+    // 原生 compressed-tensors INT4：直接吃 checkpoint 的 weight_packed/weight_scale，
+    // 走 K100LC-kernels 的 int4_dot_k（W4A16：激活保持 f32，只有权重是 4bit）。
+    // 解码与 MTP 验证批（M ≤ 4）默认走它；预填充默认仍用 RT4 的 W4A8 GEMM
+    // （同权重，激活 int8，快得多），RT_INT4_PREFILL=native 可强制也走原生内核。
+    if (w.has_int4()) {
+        static const int pre_native =
+            getenv("RT_INT4_PREFILL") ? atoi(getenv("RT_INT4_PREFILL")) : 0;
+        if (M <= 4 || pre_native) {
+            if (row_stride != 0) { printf("int4: 暂不支持 row_stride=%d\n", row_stride); exit(1); }
+            k_int4_gemv(y, w.i4p, w.i4s, d.i4_partial, x + row_off, M, w.N, w.K);
+            return;
+        }
+    }
     // 混合模式：这份权重有原始 NVFP4，就直接跑 NVFP4 内核（激活按 16 一组量化）。
     if (w.has_nvfp4()) {
         if (row_stride != 0) { printf("nvfp4: 暂不支持 row_stride=%d\n", row_stride); exit(1); }
@@ -2082,11 +2273,17 @@ void Model::gdn_layer(int il, int n) {
     const int T = n, Hk = cfg.lk_head, Hv = cfg.lv_head, D = cfg.ldim;
     const int qn = Hk * D, vn = Hv * D;
 
+    const bool skip_g = getenv("RT_SKIP_GDN_GEMV") != nullptr;   // 只用于分段计时
+    const bool skip_c = getenv("RT_SKIP_GDN_CONV") != nullptr;
+    const bool skip_s = getenv("RT_SKIP_GDN_SSM") != nullptr;
+    const bool skip_n = getenv("RT_SKIP_GDN_NORM") != nullptr;
+    if (!skip_g) {
     linear(d.qkv3, L.in_qkv, d.xb, T);           // [T][10240] = [q(2048) k(2048) v(6144)]
     linear(d.gz, L.in_z, d.xb, T);               // z [T][6144]
+    }
     db(il, 1, d.qkv3, (long long)T * (qn * 2 + vn));
     db(il, 2, d.gz, (long long)T * vn);
-    {
+    if (!skip_c) {
         ProfTick _t(pa(P_CONV));
         // 卷积要读「更新前」的状态，所以先快照
         CK(hipMemcpyAsync(d.conv_prev, conv_state[il],
@@ -2104,7 +2301,7 @@ void Model::gdn_layer(int il, int n) {
         }
     }
     db(il, 3, d.conv, (long long)T * (qn * 2 + vn));
-    {
+    if (!skip_c) {
         ProfTick _t(pa(P_GNORM));
         k_split_qkv(d.gq, d.gk, d.gv, d.conv, T, qn, qn, vn);
         k_l2norm(d.gq, T * Hk, D, cfg.eps);
@@ -2114,7 +2311,7 @@ void Model::gdn_layer(int il, int n) {
     db(il, 5, d.gk, (long long)T * qn);
     db(il, 6, d.gv, (long long)T * vn);
 
-    {
+    if (!skip_s) {
         ProfTick _t(pa(P_SSM));
         k_ssm_ab_gate(d.gab, d.gbeta, d.gg, (const float*)L.ssm_alpha.p,
                       (const float*)L.ssm_beta.p, d.xb, (const float*)L.dt_bias.p,
@@ -2123,7 +2320,7 @@ void Model::gdn_layer(int il, int n) {
     db(il, 7, d.gab, (long long)2 * T * Hv);     // a | b（b 还是 logits）
     db(il, 8, d.gbeta, (long long)T * Hv);       // beta
     db(il, 9, d.gg, (long long)T * Hv);                     // g
-    {
+    if (!skip_s) {
         ProfTick _t(pa(P_GDNA));
         if (snap_mode) {
             const size_t ssm_one = (size_t)Hv * D * D;
@@ -2136,14 +2333,14 @@ void Model::gdn_layer(int il, int n) {
         }
     }
     db(il, 10, d.hout, (long long)T * vn);
-    {
+    if (!skip_n) {
         ProfTick _t(pa(P_GNORM));
         k_rmsnorm_gated(d.hout, d.hout, (const float*)L.ssm_norm.p, d.gz, T * Hv, D, cfg.eps);
     }
     db(il, 11, d.hout, (long long)T * vn);
-    linear(d.gz, L.out_proj, d.hout, T);
+    if (!skip_g) linear(d.gz, L.out_proj, d.hout, T);
     db(il, 12, d.gz, (long long)T * cfg.hidden);
-    k_add_inplace(d.x, d.gz, (long long)T * cfg.hidden);
+    if (!skip_n) k_add_inplace(d.x, d.gz, (long long)T * cfg.hidden);
 }
 
 // --------------------------------- MLP -------------------------------------
@@ -2198,10 +2395,12 @@ void Model::forward(const int* ids, int n, bool log_last, int log_rows, bool ext
         pf.wait_group(1 + il);   // 这一层的权重到了再算；加载线程同时在搬下一层
         { ProfTick _t(pa(P_NORM));
           k_rmsnorm(d.xb, d.x, (const float*)layers[il].in_ln.p, n, cfg.hidden, cfg.eps, true); }
-        if (layers[il].full) attention_layer(il, n); else gdn_layer(il, n);
+        // RT_SKIP_* 只用于量各段开销（结果必然是错的）
+        if (layers[il].full) { if (!getenv("RT_SKIP_ATTN")) attention_layer(il, n); }
+        else                 { if (!getenv("RT_SKIP_GDN"))  gdn_layer(il, n); }
         { ProfTick _t(pa(P_NORM));
           k_rmsnorm(d.xb, d.x, (const float*)layers[il].post_ln.p, n, cfg.hidden, cfg.eps, true); }
-        mlp_layer(il, n);
+        if (!getenv("RT_SKIP_MLP")) mlp_layer(il, n);
         if (stats) print_stats(il, n);
         if (dump_layers && std::find(dump_layers->begin(), dump_layers->end(), il) != dump_layers->end())
             dump_x(il, n);

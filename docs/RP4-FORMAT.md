@@ -45,16 +45,16 @@ type  part  name  kind  N  K  group  off  nbytes  soff  gscale
 
 ## 里面装了什么
 
-默认布局（`bash scripts/pack_weights.sh`，**主模型 W4A8 / MTP W8A8 / 不装视觉塔**）：
+默认布局（`bash scripts/pack_weights.sh`，**主模型 W4A8 / MTP W4A8（int4）/ 不装视觉塔**）：
 
 ```
 main    851 个  = 主模型全部张量，原样保留 RT4 的 int4 权重（W4A8：int4 权重 ×
                   int8 激活）。**不做任何 NVFP4 替换**，所以一个张量都不丢。
-mtp      23 个  = MTP 头，int8/W8A8（每个矩阵拆成 <name>.hi / <name>.lo 两张 int4）
+mtp      15 个  = MTP 头，int4/W4A8（`MTP_W8=1` 才换成 int8/W8A8 的 23 张 .hi/.lo）
 visual    0 个  = 不装：引擎单独读 rt4/qwen38_27b_vision.rt4，27 层在 DCU 上跑
 ```
 
-合计 **874 条索引、14.351 GB 载荷**（`qwen38_27b.rt4` 13.91 + `mtp_w8.rt4` 0.44）。
+合计 **866 条索引、约 14.13 GB 载荷**（`qwen38_27b.rt4` 13.91 + `mtp.rt4` 0.22）。
 引擎只读这一个文件；视觉塔是**独立的一份** `rt4/qwen38_27b_vision.rt4`（0.93 GB），
 由引擎自己加载到显卡（`RT_VISION_DEVICE=gpu`，默认）或交给 CPU 编码器（`cpu`）。
 
@@ -63,7 +63,7 @@ visual    0 个  = 不装：引擎单独读 rt4/qwen38_27b_vision.rt4，27 层�
 
 | 布局 | 主模型 | mtp | visual | 索引 | 载荷 |
 |---|---|---|---|---|---|
-| 默认 | W4A8（int4） | w8（23） | 不装 | 874 | 14.351 GB |
+| 默认 | W4A8（int4） | i4（15） | 不装 | 866 | ~14.13 GB |
 | `NVFP4_ALL=mlp` | MLP 168 个走 NVFP4 | w8 | 不装 | ~1543 | 15.984 GB |
 | `NVFP4_ALL=all` | 401 个线性层走 NVFP4 | w8 | 不装 | ~2009 | 16.482 GB |
 | 加 `VISION_RP4=1` | 同上 | 同上 | 333 个装进来 | +333 | +0.93 GB |
@@ -72,17 +72,17 @@ visual    0 个  = 不装：引擎单独读 rt4/qwen38_27b_vision.rt4，27 层�
 `all` 档：另外 233 个（注意力/线性注意力投影、lm_head、第 56~63 层 MLP）由
 `tools/nvfp4_quant.py` 从 FP8 按同一规格重量化。各档性能见 [BENCHLOG.md](BENCHLOG.md)。
 
-**MTP 头默认是 int8（W8A8）**：checkpoint 里的 MTP 是 BF16，直接按 int4 量化误差
-≈12.8%，会拖投机解码的接受率。`tools/mtp_w8_pack.py`（`scripts/convert_weights.sh`
-默认会跑）把每个矩阵的 int8 量化码拆成 `w8 = 16*wh + wl`，输出
+**MTP 头默认是 int4（W4A8）**，和全项目默认一致；checkpoint 里的 MTP 是 BF16，
+直接按 int4 量化误差 ≈12.8%，接受率会比 int8 版低一些。要换 int8/W8A8 就
+`MTP_W8=1`：`tools/mtp_w8_pack.py` 把每个矩阵的 int8 量化码拆成 `w8 = 16*wh + wl`，输出
 `rt4/qwen38_27b_mtp_w8.rt4`——两张 int4 张量共用同一个组尺度（hi 的预乘 16），
 运行时「hi 跑一遍 int4 + lo 再跑一遍再相加」就等价于 int8 权重 × int8 激活，
 不需要新内核。误差 12.8% → 0.9%。
 
 运行时靠「索引里没有 `mtp.fc.weight`、只有 `mtp.fc.weight.hi`」自动识别这个格式
 （`src/model.cpp` 的 `mtp.w8`），所以打进 `.rp4` 之后不用开任何开关。代价是
-MTP 张量从 15 个变成 23 个、载荷 +219 MB。想回到 int4 版：
-`MTP_W8=0 bash scripts/pack_weights.sh`（打包时）或 `MTP_W8=0 bash scripts/convert_weights.sh`（转换时）。
+MTP 张量从 15 个变成 23 个、载荷 +219 MB。默认就是 int4 版（不用设什么），
+只有 `MTP_W8=1` 才切到 W8A8。
 
 ## 运行时怎么用
 

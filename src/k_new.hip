@@ -786,3 +786,72 @@ void k_split_qkv(float* q, float* k, float* v, const float* c, int T, int qn, in
     const long long n = (long long)T * (qn + kn + vn);
     split_qkv_k<<<grid_for(n, 256), 256>>>(q, k, v, c, T, qn, kn, vn); CK(hipGetLastError());
 }
+
+// ============ 原生 compressed-tensors INT4（内核来自 K100LC-kernels 包）============
+// 权重是 checkpoint 的**原字节**，不转换、不重量化：
+//   weight_packed I32  [N][K/8]    8 个 4bit 码 / 字，低半字节 = 更小的 k
+//   weight_scale  BF16 [N][K/128]  每 128 个 k 一个尺度，无 global scale
+//   w[n,k] = (码 - 8) * bf16(scale[n, k/128])        码 offset-binary ∈ [0,15]
+// 一个 work-item 解「一个 128 权重块 × 一行」并点积，写 partial[块号]；
+// reduce_blocks_k 再把每行 nbpr 个 partial 求和成 y[row]。
+// 格式/ABI/对账见 K100LC-kernels/docs/INT4.md。
+
+// 整数除法的魔法乘数：q = (i * M) >> 32 == i / d。
+// 与 K100LC-kernels/tools/gen_gemv_qdot.py::div_magic 同一算法（逐个 i 穷举校验），
+// 同一个 (d, max_i) 只算一次 —— 每层两个，整个模型十来个组合。
+static uint32_t int4_magic_div(uint32_t d, uint32_t max_i) {
+    static uint32_t c_d[32], c_max[32], c_m[32];
+    static int c_n = 0;
+    for (int i = 0; i < c_n; i++)
+        if (c_d[i] == d && c_max[i] == max_i) return c_m[i];
+    const unsigned long long M = (1ull << 32) / d + 1;
+    if (M >= (1ull << 32)) { printf("int4: d=%u 的魔法数溢出\n", d); exit(1); }
+    for (unsigned long long i = 0; i < max_i; i++)
+        if (((i * M) >> 32) != i / d) {
+            printf("int4: d=%u max_i=%u 无法用 32 位魔法数表示（i=%llu）\n", d, max_i, i);
+            exit(1);
+        }
+    if (c_n < 32) { c_d[c_n] = d; c_max[c_n] = max_i; c_m[c_n] = (uint32_t)M; c_n++; }
+    return (uint32_t)M;
+}
+
+// y[rows][N] = W[N][K] · x[rows][K]。partial 由调用方给（至少 N * K/128 个 float）。
+// 逐行发射：HSA 队列按序执行，所以 partial 可以复用同一块暂存。
+void k_int4_gemv(float* y, const uint32_t* wp, const unsigned short* ws, float* partial,
+                 const float* x, int rows, int N, int K) {
+    const uint32_t nbpr = (uint32_t)(K / 128);
+    const uint32_t nblk = (uint32_t)N * nbpr;
+    static uint32_t* ids0 = nullptr;                  // dense：只需要 ids[0] = 0
+    if (!ids0) {
+        void* p = nullptr;
+        CK(hipMalloc(&p, 4));
+        CK(hipMemset(p, 0, 4));
+        ids0 = (uint32_t*)p;
+    }
+    const uint32_t m1 = int4_magic_div(nbpr, nblk);
+    const uint32_t m2 = int4_magic_div((uint32_t)N, (uint32_t)N + 1);
+    // RT_INT4_DEBUG=1：把第一次调用拿到的权重/尺度/激活头几个值打回主机看
+    static int dbg_done = 0;
+    if (!dbg_done && getenv("RT_INT4_DEBUG")) {
+        dbg_done = 1;
+        uint32_t hw[4] = {0, 0, 0, 0};
+        unsigned short hs[4] = {0, 0, 0, 0};
+        float hx[4] = {0, 0, 0, 0};
+        CK(hipMemcpy(hw, wp, sizeof(hw), hipMemcpyDeviceToHost));
+        CK(hipMemcpy(hs, ws, sizeof(hs), hipMemcpyDeviceToHost));
+        CK(hipMemcpy(hx, x, sizeof(hx), hipMemcpyDeviceToHost));
+        printf("[int4 dbg] N=%d K=%d rows=%d nbpr=%u nblk=%u m1=%u m2=%u\n", N, K, rows,
+               nbpr, nblk, m1, m2);
+        printf("[int4 dbg] w=%08x %08x %08x %08x  s=%04x %04x %04x %04x  x=%g %g %g\n",
+               hw[0], hw[1], hw[2], hw[3], hs[0], hs[1], hs[2], hs[3], hx[0], hx[1], hx[2]);
+    }
+    for (int r = 0; r < rows; r++) {
+        // 128 权重 / 块 → 一个块一个 work-item；grid 是块数（不是 work-item 数）
+        int4_dot_k<<<(nblk + 63) / 64, 64>>>(wp, x + (size_t)r * K, partial, nblk, 64,
+                                             nbpr, m1, (uint32_t)N, m2, ws, ids0,
+                                             nbpr * 64, (uint32_t)N, m2);
+        reduce_blocks_k<<<(N + 63) / 64, 64>>>(partial, y + (size_t)r * N,
+                                               (uint32_t)N, nbpr);
+    }
+    CK(hipGetLastError());
+}

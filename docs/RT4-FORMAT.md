@@ -34,8 +34,9 @@ MFMA / WMMA 在 gfx926 上不存在（汇编器全部拒绝）。显存可用带
   `out_proj[6144,5120]` FP8 = 5.56GB，另加 f32 的 `A_log`/`dt_bias`/`conv1d`
 * 16 层全注意力（每 4 层一个）：`q_proj[12288,5120]`（含输出门，24 头×256×2）、
   `k,v[1024,5120]`、`o_proj[6144,5120]` FP8 = 1.68GB
-* `model.visual.*` 0.92GB（视觉塔）——单独转成 RT4（线性层 f16，
-  norm/bias/pos f32），由运行时自己的 27 层视觉块加载执行
+* `model.visual.*`（视觉塔）——单独转成 RT4：线性层默认 int4/128（W4A8，
+  `tools/convert_vision_rt4.py`，`--f16` 可退回 f16），norm/bias/pos f32，
+  由运行时自己的 27 层视觉块加载执行
 * 结构要点：64 层，`linear:full = 3:1`；MRoPE `partial_rotary_factor=0.25`（只旋转 64/256 维）；
   `attn_output_gate=true`；`mtp_num_hidden_layers=1`；`kv_cache_scheme` 为 8bit（自带 k_scale/v_scale）
 

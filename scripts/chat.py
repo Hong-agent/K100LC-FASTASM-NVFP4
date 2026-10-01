@@ -252,7 +252,12 @@ def main():
         ids = T.encode(text_in)
     if args.dump_layers:
         os.environ['RT_DUMP_BUF'] = '1'
-    eng = Engine(log=True, mtp_n=args.mtp_n, no_mtp=args.no_mtp)
+    # 原生 int4 内核（RT_INT4_NATIVE=1，默认）下 MTP 的验证批要按行重读权重，
+    # 实测反而更慢（6.9 vs 10.1 tok/s）→ 不显式指定 MTP 时就关掉。
+    mtp_n = args.mtp_n
+    if mtp_n is None and not args.no_mtp and os.environ.get('RT_INT4_NATIVE', '1') != '0':
+        mtp_n = 0
+    eng = Engine(log=True, mtp_n=mtp_n, no_mtp=args.no_mtp)
     try:
         t0 = time.time()
         st = eng.prefill(ids)
