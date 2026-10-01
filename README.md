@@ -202,7 +202,7 @@ bash scripts/deploy_online.sh         # 下模型 → 转换 → 打包权重 �
 **离线整包**——源码 + 模型 + 驱动 + 自带运行时 + 预编译引擎，解压就能跑：
 
 ```bash
-bash scripts/make_offline_package.sh  # → dist/K100LC-FASTASM-NVFP4-离线部署-<日期>.zip（~14.9 GB）
+bash scripts/make_offline_package.sh  # → dist/K100LC-FASTASM-NVFP4-离线部署-<日期>.zip（~14.8 GB）
 # 目标机（不联网）：
 unzip K100LC-FASTASM-NVFP4-离线部署-<日期>.zip && cd K100LC-FASTASM-NVFP4
 HY_INSTALL_DRIVER=1 bash deploy-offline.sh    # 装驱动（不限内核）→ 起服务
@@ -280,7 +280,7 @@ RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 kernels/asm/*.s + kernel_spec.json
         │  tools/build_kernels.py（自研汇编器 asm.py）
         ▼
-build/kernels/*.bin ──► tools/make_hsaco_multi.py ──► build/k100lc_all.hsaco（80 内核）
+build/kernels/*.bin ──► tools/make_hsaco_multi.py ──► build/k100lc_all.hsaco（119 内核）
         │
         │  tools/gen_nodtk.py：剥掉设备代码、kernel<<<>>> → hsart_launch(...)
         ▼

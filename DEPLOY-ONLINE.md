@@ -53,7 +53,7 @@ bash scripts/fetch_model.sh            # 下源权重（16 连接断点续传，
 bash scripts/setup_models.sh           # 把权重接进 models/Qwen3.8-27B-INT4/
 bash scripts/convert_weights.sh        # 转成 RT4（主机 gcc，约 4.5 分钟）
 bash scripts/pack_weights.sh           # 合成单文件 build/model-int4.rp4（约 14.4 GB，几分钟）
-bash build.sh                          # 自研汇编器汇编 80 内核 → HSACO → g++ 编出 build/rt
+bash build.sh                          # 自研汇编器汇编 119 内核 → HSACO → g++ 编出 build/rt
 ```
 
 每一步都是幂等的，跑一半断了再跑一次即可（下载也会断点续传）。
@@ -81,10 +81,11 @@ curl -s localhost/v1/chat/completions -H 'Content-Type: application/json' \
 
 源码包里带了预编译引擎（`prebuilt/rt` + `prebuilt/k100lc_all.hsaco`），
 跑 `run.sh` / `serve.sh` 时会自动用它；**只有改内核/改运行时才需要 `build.sh`**。
-权重仍然要按第 3 步准备（源模型 → RT4 → `build/model-int4.rp4`）。
+权重仍然要按第 3 步准备（源模型 → RT4：主模型 / MTP / 视觉塔三个 `.rt4`）。
 
 如果连转换也不想在目标机做，可以直接用离线整包
-`K100LC-FASTASM-NVFP4-离线部署-<日期>.zip`（里面已经带了 int4 的 `model.rp4`）。
+`K100LC-FASTASM-NVFP4-离线部署-<日期>.zip`（里面已经带了全 W4A8 的三个
+`.rt4`：主模型 + MTP + 视觉塔，外加驱动与自带 Python 运行时）。
 
 想改成上游 NVFP4 checkpoint 那条路线：`VARIANT=nvfp4 bash scripts/fetch_model.sh`，
 再按第 3 步转换/打包（打包时加 `RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4 RP4=build/model.rp4`），

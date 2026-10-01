@@ -45,7 +45,11 @@ fi
 
 hr "2/3 模型与运行时"
 ok=1
-for f in models/Qwen3.8-27B-INT4/model.rp4 \
+for f in models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4 \
+         models/Qwen3.8-27B-INT4/rt4/qwen38_27b.rt4.json \
+         models/Qwen3.8-27B-INT4/rt4/qwen38_27b_mtp.rt4 \
+         models/Qwen3.8-27B-INT4/rt4/qwen38_27b_mtp.rt4.json \
+         models/Qwen3.8-27B-INT4/rt4/qwen38_27b_vision.rt4 \
          models/Qwen3.8-27B-INT4/tokenizer.json \
          prebuilt/rt prebuilt/k100lc_all.hsaco; do
   if [ -e "$f" ]; then echo "  OK   $f"; else echo "  MISS $f" >&2; ok=0; fi
@@ -59,7 +63,8 @@ fi
 
 hr "3/3 起服务"
 echo "  引擎：$( [ -x build/rt ] && echo build/rt || echo prebuilt/rt )（自研 HSACO + /opt/hyhal 的 HSA）"
-echo "  模型：Qwen3.8-27B-INT4 的 model.rp4（int4 主模型 + int8 MTP；KV cache 走 int8，每 dword 4 个元素，尺度 amax/127）"
+echo "  模型：Qwen3.8-27B-INT4/rt4 下的全 W4A8 权重（int4 主模型 + int4 MTP + int4 视觉塔；"
+echo "        KV cache 走 int8，每 dword 4 个元素，尺度 amax/127）"
 echo "  网页默认 maxtoken = 40960，上下文 CTX=${CTX:-40960}"
 # 默认监听 80（局域网访问不用带端口号），这是特权端口：非 root 时给解释器加一次能力。
 if [ "${PORT:-80}" -lt 1024 ] && [ "$(id -u)" != 0 ] && command -v getcap >/dev/null 2>&1; then

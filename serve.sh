@@ -37,16 +37,8 @@ export RT_ENGINE_BIN="${RT_ENGINE_BIN:-$RT_ROOT/build/rt}"
 export RT_SERVED_NAME="${RT_SERVED_NAME:-qwen38-fastasm-int4}"
 # RT_VISION_DEVICE 默认 gpu，由 scripts/env.sh 设置（视觉塔不进 .rp4，从 RT_VISION_RT4 单独加载）
 
-# 80 是特权端口：非 root 时要么给解释器一次性加能力，要么退回高位端口。
-if [ "$PORT" -lt 1024 ] && [ "$(id -u)" != 0 ] && command -v getcap >/dev/null 2>&1; then
-  if ! getcap "$RT_PYTHON" 2>/dev/null | grep -q cap_net_bind_service; then
-    echo "端口 $PORT 是特权端口，而 $RT_PYTHON 没有 cap_net_bind_service。" >&2
-    echo "  一次性授权： sudo setcap 'cap_net_bind_service=+ep' $RT_PYTHON" >&2
-    echo "  或改用高位端口： PORT=8080 bash serve.sh" >&2
-    exit 1
-  fi
-fi
-
+# --stop 只读 pidfile，不碰端口：必须放在特权端口检查**之前**，
+# 否则默认 80 + 没有 cap_net_bind_service 时会先报错退出，服务停不掉。
 if [ "${1:-}" = "--stop" ]; then
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     SRV_PID="$(cat "$PIDFILE")"
@@ -58,6 +50,16 @@ if [ "${1:-}" = "--stop" ]; then
     echo "serve 未运行"
   fi
   exit 0
+fi
+
+# 80 是特权端口：非 root 时要么给解释器一次性加能力，要么退回高位端口。
+if [ "$PORT" -lt 1024 ] && [ "$(id -u)" != 0 ] && command -v getcap >/dev/null 2>&1; then
+  if ! getcap "$RT_PYTHON" 2>/dev/null | grep -q cap_net_bind_service; then
+    echo "端口 $PORT 是特权端口，而 $RT_PYTHON 没有 cap_net_bind_service。" >&2
+    echo "  一次性授权： sudo setcap 'cap_net_bind_service=+ep' $RT_PYTHON" >&2
+    echo "  或改用高位端口： PORT=8080 bash serve.sh" >&2
+    exit 1
+  fi
 fi
 
 if [ ! -x "$RT_ENGINE_BIN" ]; then
