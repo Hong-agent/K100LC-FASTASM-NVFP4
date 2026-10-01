@@ -28,6 +28,17 @@
 #include <vector>
 
 // 分段计时（RT_Q36_PROF=1）
+extern "C" unsigned long long hsart_launch_count();   // runtime/hsa_rt.cpp
+
+// 按区段统计内核投递次数（RT_Q36_PROF=1 时打印）：解码时间 ≈ 投递次数 × 8.4 µs，
+// 所以「每个区段投递了多少次」直接等于它占了多少时间。
+std::map<std::string, unsigned long long> g_lcount;
+struct LaunchCnt {
+    const char* tag; unsigned long long l0;
+    explicit LaunchCnt(const char* t) : tag(t), l0(hsart_launch_count()) {}
+    ~LaunchCnt() { g_lcount[tag] += hsart_launch_count() - l0; }
+};
+
 struct Prof {
     double attn = 0, moe = 0, head = 0, embed = 0;
     long long n = 0;
@@ -40,6 +51,11 @@ struct Prof {
         fprintf(stderr, "/token: attn=%.1fms moe=%.1fms head=%.1fms embed=%.1fms (%.1fms/token, n=%lld)\n",
                 attn / n, moe / n, head / n, embed / n,
                 (attn + moe + head + embed) / n, n);
+        // 投递次数分布：单次投递实测 8.4 µs，所以「次数」就是时间。
+        for (auto& kv : g_lcount)
+            fprintf(stderr, "  投递 %-10s %7llu 次/token（%.1f ms）\n", kv.first.c_str(),
+                    kv.second / (unsigned long long)n,
+                    (double)kv.second / (double)n * 0.0084);
     }
 };
 
@@ -376,6 +392,39 @@ inline uint16_t f32_to_f16(float f) {
 
 // t：设备上的 Q8_0 张量（行 = 行，列 = K，第二/三维都被展平成行）
 bool packchk_done = false;
+
+// W8（Q8_0/f32 线性权重重打包成 hi/lo int4 + 现役 W4A8 内核）默认开启；
+// RT_Q36_W8=0 回退纯 Q8 路径（慢 5~86 倍，只用于对拍）。
+bool w8_on() {
+    const char* e = getenv("RT_Q36_W8");
+    return !(e && e[0] == '0' && e[1] == 0);
+}
+
+// W8 打包的共用部分：把「一行里第 g 组的 128 个 f32 权重」量化成
+// q ∈ [-120,119]（尺度 sc = amax/119，留出 int4 高位不溢出），再拆成
+// q = 16*hi + lo（hi、lo 都是二进制补码 int4 ∈ [-8,7]）。
+// hi_p/lo_p 是这一行的打包缓冲起点（K/8 个 dword），shi_p/slo_p 是尺度起点。
+static void split_group128(const float* blk, uint32_t* hi_p, uint32_t* lo_p,
+                           uint16_t* shi_p, uint16_t* slo_p, int g) {
+    float amax = 0.f;
+    for (int i = 0; i < 128; i++) amax = std::max(amax, fabsf(blk[i]));
+    // 与 tools/mtp_w8_pack.py（27B 已验证）一致：若按 amax/127 量化，q≥120 时
+    // hi=(q+8)>>4=8 会溢出成 -8（符号翻转），单个权重就差 256*sc。
+    const float sc = amax > 0 ? amax / 119.f : 1.f;
+    shi_p[g] = f32_to_f16(sc * 16.f);
+    slo_p[g] = f32_to_f16(sc);
+    for (int i = 0; i < 128; i++) {
+        int q = (int)lrintf(blk[i] / sc);
+        q = std::max(-120, std::min(119, q));
+        const int hi4 = (q + 8) >> 4;              // floor，∈ [-8,7]
+        const int lo4 = q - 16 * hi4;              // ∈ [-8,7]
+        const size_t dw = (size_t)(g * 128 + i) / 8;
+        const int sh = 4 * ((g * 128 + i) % 8);
+        hi_p[dw] |= (uint32_t)(hi4 & 0xF) << sh;
+        lo_p[dw] |= (uint32_t)(lo4 & 0xF) << sh;
+    }
+}
+
 W8 pack_q8(DevTensor* t) {
     const int K = (int)t->dims[0];
     long long rows = 1;
@@ -404,9 +453,12 @@ W8 pack_q8(DevTensor* t) {
         shi.assign((size_t)rn * nb128, 0);
         slo.assign((size_t)rn * nb128, 0);
         for (long long r = 0; r < rn; r++) {
+            uint32_t* hr = hi.data() + (size_t)r * (K / 8);
+            uint32_t* lr = lo.data() + (size_t)r * (K / 8);
+            uint16_t* shr = shi.data() + (size_t)r * nb128;
+            uint16_t* slr = slo.data() + (size_t)r * nb128;
+            float blk[128];
             for (int g = 0; g < nb128; g++) {
-                float blk[128];
-                float amax = 0.f;
                 for (int s32 = 0; s32 < 4; s32++) {
                     const uint8_t* bp = src.data() + ((size_t)r * nb32 + g * 4 + s32) * 34;
                     uint16_t hh; memcpy(&hh, bp, 2);
@@ -418,22 +470,9 @@ W8 pack_q8(DevTensor* t) {
                     for (int i = 0; i < 32; i++) {
                         const float v = d * (float)((const int8_t*)bp)[2 + i];
                         blk[s32 * 32 + i] = v;
-                        amax = std::max(amax, fabsf(v));
                     }
                 }
-                const float sc = amax > 0 ? amax / 127.f : 1.f;
-                shi[(size_t)r * nb128 + g] = f32_to_f16(sc * 16.f);
-                slo[(size_t)r * nb128 + g] = f32_to_f16(sc);
-                for (int i = 0; i < 128; i++) {
-                    int q = (int)lrintf(blk[i] / sc);
-                    q = std::max(-128, std::min(127, q));
-                    const int hi4 = (q + 8) >> 4;          // floor，∈ [-8,7]
-                    const int lo4 = q - 16 * hi4;           // ∈ [-8,7]
-                    const size_t dword = (size_t)r * (K / 8) + (size_t)(g * 128 + i) / 8;
-                    const int sh = 4 * ((g * 128 + i) % 8);
-                    hi[dword] |= (uint32_t)(hi4 & 0xF) << sh;
-                    lo[dword] |= (uint32_t)(lo4 & 0xF) << sh;
-                }
+                split_group128(blk, hr, lr, shr, slr, g);
             }
         }
         CK(hipMemcpy((uint8_t*)dhi + (size_t)r0 * (K / 8) * 4, hi.data(), hi.size() * 4,
@@ -478,14 +517,67 @@ W8 pack_q8(DevTensor* t) {
                    i, q8v, w8v, hi_s, sh, lo_s, sl);
         }
     }
-    if (!getenv("RT_Q36_KEEPQ8")) CK(hipFree((void*)t->p));   // 源 Q8 用完就还显存
-    else t->nbytes = 0;
-    t->p = nullptr;
+    if (!getenv("RT_Q36_KEEPQ8")) {                            // 源 Q8 用完就还显存
+        CK(hipFree((void*)t->p));
+        t->p = nullptr;
+    }
     w.hi = dhi; w.lo = dlo; w.shi = dshi; w.slo = dslo;
     return w;
 }
 
-// y[rows] = W · x（rows ≤ 4，两遍 W4A8）
+// f32 权重（MoE 路由矩阵 blk.*.ffn_gate_inp，[K,N] f32）→ 同样的 W8 布局。
+// 动机：gemv_f32_k 是「一个线程算一行、循环里 vmcnt(0) 死等」，实测 2MB 的路由
+// 矩阵要 425~541 µs（3.7 GB/s，而空内核投递基线才 6.9 µs），每层一次就是
+// 20+ ms/token；换成 W8 GEMV（3 次投递 ≈ 30 µs）直接省掉。
+// 路由用 int8 权重（每 128 一组 f16 尺度，~0.4% 误差），top-8 选择基本不变。
+W8 pack_f32_w8(DevTensor* t) {
+    const int K = (int)t->dims[0];
+    long long rows = 1;
+    for (size_t i = 1; i < t->dims.size(); i++) rows *= t->dims[i];
+    const int nb128 = K / 128;
+    if (K % 128) { printf("pack_f32_w8: K=%d 不是 128 的倍数\n", K); exit(1); }
+    W8 w;
+    w.rows = rows; w.K = K;
+    u32* dhi = nullptr; u32* dlo = nullptr; uint16_t* dshi = nullptr; uint16_t* dslo = nullptr;
+    CK(hipMalloc(&dhi, (size_t)rows * (K / 8) * 4));
+    CK(hipMalloc(&dlo, (size_t)rows * (K / 8) * 4));
+    CK(hipMalloc(&dshi, (size_t)rows * nb128 * 2));
+    CK(hipMalloc(&dslo, (size_t)rows * nb128 * 2));
+    const long long CH_ROWS = 1024;
+    std::vector<float> src;
+    std::vector<uint32_t> hi, lo;
+    std::vector<uint16_t> shi, slo;
+    for (long long r0 = 0; r0 < rows; r0 += CH_ROWS) {
+        const long long rn = std::min(CH_ROWS, rows - r0);
+        src.resize((size_t)rn * K);
+        CK(hipMemcpy(src.data(), (const float*)t->p + (size_t)r0 * K,
+                     src.size() * 4, hipMemcpyDeviceToHost));
+        hi.assign((size_t)rn * (K / 8), 0u);
+        lo.assign((size_t)rn * (K / 8), 0u);
+        shi.assign((size_t)rn * nb128, 0);
+        slo.assign((size_t)rn * nb128, 0);
+        for (long long r = 0; r < rn; r++) {
+            uint32_t* hr = hi.data() + (size_t)r * (K / 8);
+            uint32_t* lr = lo.data() + (size_t)r * (K / 8);
+            uint16_t* shr = shi.data() + (size_t)r * nb128;
+            uint16_t* slr = slo.data() + (size_t)r * nb128;
+            for (int g = 0; g < nb128; g++)
+                split_group128(src.data() + (size_t)r * K + g * 128, hr, lr, shr, slr, g);
+        }
+        CK(hipMemcpy((uint8_t*)dhi + (size_t)r0 * (K / 8) * 4, hi.data(), hi.size() * 4,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dlo + (size_t)r0 * (K / 8) * 4, lo.data(), lo.size() * 4,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dshi + (size_t)r0 * nb128 * 2, shi.data(), shi.size() * 2,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dslo + (size_t)r0 * nb128 * 2, slo.data(), slo.size() * 2,
+                     hipMemcpyHostToDevice));
+    }
+    w.hi = dhi; w.lo = dlo; w.shi = dshi; w.slo = dslo;
+    return w;
+}
+
+// y[rows] = W · x（rows ≤ 4，两遍 W4A8：hi 一趟 + lo 一趟再相加）
 void lin_w8(float* y, const W8& w, const float* x, int rows, int n_out,
             long long row_off = 0, float* tmp = nullptr) {
     k_gemv_w4a8(y, (const u32*)((const uint8_t*)w.hi + row_off * (w.K / 8) * 4),
@@ -496,6 +588,19 @@ void lin_w8(float* y, const W8& w, const float* x, int rows, int n_out,
                 (const float*)((const uint8_t*)w.slo + row_off * (w.K / 128) * 2),
                 x, rows, n_out, (int)w.K);
     k_add_inplace(y, tmp, (long long)rows * n_out);
+}
+
+// 同 lin_w8，但激活已经在量化缓冲里（调用前先 k_w4a8_quant）。
+// aoff 是激活在量化缓冲里的元素偏移（GRP 的整数倍）——MoE 里 8 个专家的
+// gate/up 共用同一份 xb，down 的 8 份输入也拼成一块只量化一次。
+void lin_w8_q(float* y, const W8& w, int n_out, long long row_off, long long aoff, float* tmp) {
+    k_w4a8_run1(y, (const u32*)((const uint8_t*)w.hi + row_off * (w.K / 8) * 4),
+                (const float*)((const uint8_t*)w.shi + row_off * (w.K / 128) * 2),
+                n_out, (int)w.K, aoff);
+    k_w4a8_run1(tmp, (const u32*)((const uint8_t*)w.lo + row_off * (w.K / 8) * 4),
+                (const float*)((const uint8_t*)w.slo + row_off * (w.K / 128) * 2),
+                n_out, (int)w.K, aoff);
+    k_add_inplace(y, tmp, (long long)n_out);
 }
 
 // MTP（blk.40）：nextn.eh_proj + 一层全注意力 + MoE + shared_head_norm → lm_head
@@ -540,6 +645,7 @@ struct Mo35 {
           *qkv3 = nullptr, *conv = nullptr, *gq = nullptr, *gk = nullptr, *gv = nullptr,
           *gab = nullptr, *gbeta = nullptr, *gg = nullptr, *tmp = nullptr, *gbuf = nullptr,
           *ubuf = nullptr, *dbuf = nullptr, *acc = nullptr, *router = nullptr,
+          *g8 = nullptr, *u8 = nullptr,    // 8 个专家的 gate/up 输出（拼成一块，silu 一次算完）
           *shexp = nullptr,
           *partial = nullptr, *logits = nullptr, *pout = nullptr, *pmax = nullptr,
           *psum = nullptr, *conv_prev = nullptr;
@@ -749,10 +855,10 @@ void bind(Mo35& m) {
             fix_vhead(need_mut(w, nm("attn_qkv.weight")), Hk, Hv, D, true, 2 * qn, vn);
         }
     }
-    // 把 Q8_0 线性权重重打包成 W8（hi/lo int4），运行时走现役高速 W4A8 内核
-    // 注意：W8（hi/lo int4 + W4A8 内核）实测线性层快 5~86 倍，
-    // 但数值还没有对齐（整模型输出退化），所以默认关闭，用 RT_Q36_W8=1 打开。
-    if (getenv("RT_Q36_W8") && strcmp(getenv("RT_Q36_W8"), "0")) {
+    // 把 Q8_0 线性权重重打包成 W8（hi/lo int4），运行时走现役高速 W4A8 内核。
+    // 数值已对齐（RT_Q36_LINCHK 对拍 1.2%，整模型生成连贯），默认开启；
+    // 想回退纯 Q8 路径用 RT_Q36_W8=0。
+    if (w8_on()) {
         int npack = 0;
         long long bytes = 0;
         for (auto& kv : w.t) {
@@ -788,6 +894,7 @@ void alloc_bufs(Mo35& m) {
     m.gq = m.alloc(qn); m.gk = m.alloc(qn); m.gv = m.alloc(vn);
     m.gab = m.alloc(2 * c.lv_head); m.gbeta = m.alloc(c.lv_head); m.gg = m.alloc(c.lv_head);
     m.gbuf = m.alloc(MI); m.ubuf = m.alloc(MI); m.dbuf = m.alloc(H);
+    m.g8 = m.alloc((size_t)c.top_k * MI); m.u8 = m.alloc((size_t)c.top_k * MI);
     m.acc = m.alloc(H); m.router = m.alloc(E);
     m.shexp = m.alloc(1);
     m.conv_prev = m.alloc((c.conv_k - 1) * C);
@@ -859,13 +966,15 @@ void alloc_bufs(Mo35& m) {
 
 // Q8_0 线性层；expert >= 0 时按专家切片（第 3 维是专家数）
 // 若该张量已重打包成 W8，则走两遍 W4A8（快 50 倍），否则退回 Q8 融合点积。
-void lin_q8(Mo35& m, float* y, const DevTensor* t, const float* x, int expert = -1) {
+void lin_q8(Mo35& m, float* y, const DevTensor* t, const float* x, int expert = -1,
+            long long aoff = -1) {
     const int K = (int)t->dims[0];
     const int N = t->dims.size() > 1 ? (int)t->dims[1] : 1;
     auto it8 = m.w8.find(t);
     if (it8 != m.w8.end()) {
         const long long rowoff = expert >= 0 ? (long long)expert * N : 0;
-        lin_w8(y, it8->second, x, 1, N, rowoff, m.tmp8);
+        if (aoff >= 0) lin_w8_q(y, it8->second, N, rowoff, aoff, m.tmp8);
+        else           lin_w8(y, it8->second, x, 1, N, rowoff, m.tmp8);
         return;
     }
     const void* p = t->p;
@@ -877,9 +986,24 @@ void lin_q8(Mo35& m, float* y, const DevTensor* t, const float* x, int expert = 
     linear_q8(y, w, x, m.partial);
 }
 
-void lin_f32(Mo35& m, float* y, const DevTensor* t, const float* x) {
+void lin_f32(Mo35& m, float* y, const DevTensor* t, const float* x, long long aoff = -1) {
     const int K = (int)t->dims[0];
     const int N = t->dims.size() > 1 ? (int)t->dims[1] : 1;
+    // 路由/共享专家门（f32 权重）也走 W8：gemv_f32_k 太慢（一个线程一行、
+    // 循环里 vmcnt(0) 死等），2MB 的矩阵要 425~541 µs。首次调用时懒打包并缓存。
+    if (w8_on() && K % 128 == 0) {
+        auto it8 = m.w8.find(t);
+        if (it8 == m.w8.end()) {
+            DevTensor* mt = const_cast<DevTensor*>(t);
+            W8 p8 = pack_f32_w8(mt);
+            it8 = m.w8.emplace(t, p8).first;
+        }
+        if (it8->second.hi) {
+            if (aoff >= 0) lin_w8_q(y, it8->second, N, 0, aoff, m.tmp8);
+            else           lin_w8(y, it8->second, x, 1, N, 0, m.tmp8);
+            return;
+        }
+    }
     linear_f32(y, (const float*)t->p, x, N, K);
 }
 
@@ -910,6 +1034,7 @@ void embed_row(Mo35& m, int id) { embed_row_into(m, id, m.x); }
 // MoE：路由 softmax + top-k → 逐专家 gate/up/down → 加权合并；再加共享专家（sigmoid 门）
 // MoE 主体：可传任意层的权重视图（主干层 / MTP 层共用）
 void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
+    LaunchCnt _lc_("moe");
     STEP("moe: rmsnorm");
     const Cfg35& c = m.cfg;
     const int H = c.hidden, MI = c.moe_inter, E = c.n_expert, TOP = c.top_k;
@@ -923,10 +1048,15 @@ void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
     }
     k_rmsnorm(m.xb, x, (const float*)L.post_ln->p, 1, H, c.eps, false);
 
+    // W8 路径下：xb 只量化一次，本层所有 gate/up（路由、共享专家门、8 个专家）
+    // 复用同一份量化激活 —— 原来每个专家都自己量化一遍（每次 1 次内核投递）。
+    const bool pq = w8_on() && m.w8.count(L.gexp) && m.w8.count(L.uexp) && m.w8.count(L.dexp);
+    if (pq) k_w4a8_quant(m.xb, H);
+    const long long q0 = pq ? 0 : -1;
     // 路由（f32 [H,E]）→ 主机 top-k + 重归一
-    lin_f32(m, m.router, L.ginp, m.xb);
+    lin_f32(m, m.router, L.ginp, m.xb, q0);
     STEP("moe: router");
-    lin_f32(m, m.shexp, L.gshexp, m.xb);              // 1 行 × H（输出必须是设备指针）
+    lin_f32(m, m.shexp, L.gshexp, m.xb, q0);          // 1 行 × H（输出必须是设备指针）
     float shexp_gate = 0.f;
     CK(hipMemcpy(&shexp_gate, m.shexp, 4, hipMemcpyDeviceToHost));
     std::vector<float> r((size_t)E);
@@ -948,29 +1078,36 @@ void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
 
     k_fill(m.acc, 0.f, H);
 #define TRACE_SYNC(tag) do { if (getenv("RT_Q36_TRACE")) { CK(hipDeviceSynchronize()); printf("  [trace] %s\n", tag); fflush(stdout); } } while (0)
-    // 共享专家
-    lin_q8(m, m.gbuf, L.sgate, m.xb);
+    // 共享专家 + 8 个专家的 gate/up 全部复用同一份量化好的 xb
+    lin_q8(m, m.gbuf, L.sgate, m.xb, -1, q0);
     TRACE_SYNC("shexp gate ok");
-    lin_q8(m, m.ubuf, L.sup, m.xb);
+    lin_q8(m, m.ubuf, L.sup, m.xb, -1, q0);
+    STEP("moe: experts");
+    for (int k = 0; k < TOP; k++) {
+        const int e = idx[k];
+        STEP("moe: expert gate");
+        lin_q8(m, m.g8 + (size_t)k * MI, L.gexp, m.xb, e, q0);
+        STEP("moe: expert up");
+        lin_q8(m, m.u8 + (size_t)k * MI, L.uexp, m.xb, e, q0);
+    }
+    TRACE_SYNC("exp gate/up ok");
+    // silu（8 个专家一次算完；共享专家另一块）
+    k_silu_mul(m.g8, m.g8, m.u8, (long long)TOP * MI);
     k_silu_mul(m.gbuf, m.gbuf, m.ubuf, MI);
+    // 共享专家的 down 自己量化 gbuf（会覆盖上面的量化缓冲）→ 必须放在所有
+    // 「复用 xb 量化结果」的 GEMV 之后。
     lin_q8(m, m.dbuf, L.sdown, m.gbuf);
     TRACE_SYNC("shexp down ok");
     const float sg = 1.f / (1.f + expf(-shexp_gate));
     k_scale(m.dbuf, sg, H);
     k_add_inplace(m.acc, m.dbuf, H);
-    // 前 TOP 个专家
-    STEP("moe: experts");
+    // 8 个专家的 down：把 8 份 silu 输出拼成一块 [TOP][MI]，量化一次全用上
+    if (pq) k_w4a8_quant(m.g8, (long long)TOP * MI);
     for (int k = 0; k < TOP; k++) {
         const int e = idx[k];
         const float we = (float)(r[e] / wsum);
-        STEP("moe: expert gate");
-        lin_q8(m, m.gbuf, L.gexp, m.xb, e);
-        TRACE_SYNC("exp gate ok");
-        STEP("moe: expert up");
-        lin_q8(m, m.ubuf, L.uexp, m.xb, e);
-        k_silu_mul(m.gbuf, m.gbuf, m.ubuf, MI);
         STEP("moe: expert down");
-        lin_q8(m, m.dbuf, L.dexp, m.gbuf, e);
+        lin_q8(m, m.dbuf, L.dexp, m.g8 + (size_t)k * MI, e, pq ? (long long)k * MI : -1);
         TRACE_SYNC("exp down ok");
         k_scale(m.dbuf, we, H);
         k_add_inplace(m.acc, m.dbuf, H);
@@ -1056,6 +1193,7 @@ void bind_mtp(Mo35& m) {
 
 // 全注意力层（每 4 层一个）：q 带 gate、q/k 各自 RMSNorm、部分 RoPE、int8 KV + FA
 void attn_full(Mo35& m, int il) {
+    LaunchCnt _lc_("attn_full");
     STEP("attn_full");
     const Cfg35& c = m.cfg;
     Mo35::L& L = m.Ls[il];
@@ -1071,9 +1209,13 @@ void attn_full(Mo35& m, int il) {
         if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
     };
     k_rmsnorm(m.xb, m.x, (const float*)L.in_ln->p, 1, Hd, c.eps, false);
-    lin_q8(m, m.qfull, L.q, m.xb);
-    lin_q8(m, m.hkk, L.k, m.xb);
-    lin_q8(m, m.hvv, L.v, m.xb);
+    // q/k/v 共用同一份 xb：量化一次
+    const bool pq = w8_on() && m.w8.count(L.q) && m.w8.count(L.k) && m.w8.count(L.v);
+    if (pq) k_w4a8_quant(m.xb, Hd);
+    const long long q0 = pq ? 0 : -1;
+    lin_q8(m, m.qfull, L.q, m.xb, -1, q0);
+    lin_q8(m, m.hkk, L.k, m.xb, -1, q0);
+    lin_q8(m, m.hvv, L.v, m.xb, -1, q0);
     k_gather_heads(m.hq, m.qfull, 1, H, D, pd, 0, 2 * D);
     k_gather_heads(m.hgate, m.qfull, 1, H, D, pd, D, 2 * D);
     dumpf("l3_xb", m.xb, Hd);
@@ -1122,6 +1264,7 @@ void attn_full(Mo35& m, int il) {
 
 // 线性注意力层（gated delta net）
 void attn_lin(Mo35& m, int il) {
+    LaunchCnt _lc_("attn_lin");
     STEP("attn_lin: qkv/z");
     const Cfg35& c = m.cfg;
     Mo35::L& L = m.Ls[il];
@@ -1137,8 +1280,12 @@ void attn_lin(Mo35& m, int il) {
         if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
     };
     k_rmsnorm(m.xb, m.x, (const float*)L.in_ln->p, 1, Hd, c.eps, false);
-    lin_q8(m, m.qkv3, L.qkv, m.xb);
-    lin_q8(m, m.z_, L.z, m.xb);
+    // qkv 与 z 共用同一份 xb：量化一次（省下一次投递）
+    const bool pq = w8_on() && m.w8.count(L.qkv) && m.w8.count(L.z);
+    if (pq) k_w4a8_quant(m.xb, Hd);
+    const long long q0 = pq ? 0 : -1;
+    lin_q8(m, m.qkv3, L.qkv, m.xb, -1, q0);
+    lin_q8(m, m.z_, L.z, m.xb, -1, q0);
     dumpf("l0_xb", m.xb, Hd);
     dumpf("l0_qkv", m.qkv3, C);
     dumpf("l0_z", m.z_, vn);
@@ -1545,6 +1692,7 @@ std::vector<int> decode_step(Mo35& m, int cur, int K) {
 }
 
 int forward1(Mo35& m, int id) {
+    LaunchCnt _lc_("forward1 全部");
     STEP("forward1: embed");
     const bool prof = getenv("RT_Q36_PROF") != nullptr;
     auto tick = std::chrono::steady_clock::now();
@@ -1982,6 +2130,33 @@ int run_moe35(int argc, char** argv) {
         bench("expert_gate(512x2048)", m.Ls[0].gexp, 0, m.gbuf);
         bench("expert_down(2048x512)", m.Ls[0].dexp, 0, m.dbuf);
         bench("lm_head(248320x2048)", m.lmhead, -1, m.logits);
+        // 发射开销基线：空内核连续跑 (it*10) 次，得到「每次投递」的墙钟成本。
+        // 专家路径每层 8 专家 × 3 矩阵 × 3 次投递 = 72 次投递，全靠这个数解释。
+        {
+            auto t1 = std::chrono::steady_clock::now();
+            const int n = it * 10;
+            for (int i = 0; i < n; i++) k_fill(m.acc, 0.f, m.cfg.hidden);
+            CK(hipDeviceSynchronize());
+            const double us = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t1).count() * 1000 / n;
+            printf("%-28s                        %.2f µs/次（空内核投递基线）\n",
+                   "k_fill(2048)", us);
+        }
+        // 8 个专家一次发射（专家张量行布局就是 [E*N][K]，拿连续 4096 行等价于
+        // 合并内核去掉 gather 的成本）—— 用来验证「合并发射」能省多少。
+        {
+            auto it8 = m.w8.find(m.Ls[0].gexp);
+            if (it8 != m.w8.end()) {
+                auto t1 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; i++)
+                    lin_w8(m.logits, it8->second, m.xb, 1, 8 * 512, 0, m.tmp8);
+                CK(hipDeviceSynchronize());
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t1).count() / it;
+                printf("%-28s N=%-6d K=%-6d  %.1f µs/次（8 专家合并发射）\n",
+                       "expert_gate x8 合并", 8 * 512, 2048, ms * 1000);
+            }
+        }
         return 0;
     }
     if (check_rows) {
@@ -2017,17 +2192,21 @@ int run_moe35(int argc, char** argv) {
         int produced = 0;
         while (produced < gen_n) {
             const auto t0 = std::chrono::steady_clock::now();
+            const unsigned long long l0 = hsart_launch_count();
             std::vector<int> o = decode_step(m, last, m.mtp_enabled ? m.mtp_k : 0);
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - t0).count();
+            const unsigned long long dn = hsart_launch_count() - l0;
             for (int tk : o) {
                 if (produced++ >= gen_n) break;
                 printf("TOKEN %d\n", tk);
                 fflush(stdout);
                 last = tk;
             }
-            fprintf(stderr, "  gen %d/%d，本轮 %zu token（%.0f ms，%.0f ms/token）\n",
-                    produced, gen_n, o.size(), ms, ms / (double)o.size());
+            fprintf(stderr, "  gen %d/%d，本轮 %zu token（%.0f ms，%.0f ms/token），"
+                            "投递 %llu 次（%.2f µs/次）\n",
+                    produced, gen_n, o.size(), ms, ms / (double)o.size(),
+                    dn, dn ? ms * 1000.0 / (double)dn : 0.0);
         }
     }
     if (m.mtp_try)

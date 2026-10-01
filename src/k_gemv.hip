@@ -64,21 +64,49 @@ static float*  s_asc = nullptr;
 static int*    s_asu = nullptr;
 static long long s_cap8 = 0;
 
+// 激活缓冲按需扩容（elems = 元素数 = rows×K）
+static void w4a8_ensure(long long elems) {
+    if (elems <= s_cap8) return;
+    if (s_ae) hipFree(s_ae);
+    if (s_ao) hipFree(s_ao);
+    if (s_asc) hipFree(s_asc);
+    if (s_asu) hipFree(s_asu);
+    hipMalloc(&s_ae, elems / 2 + 64);
+    hipMalloc(&s_ao, elems / 2 + 64);
+    hipMalloc(&s_asc, elems / GRP * 4 + 64);
+    hipMalloc(&s_asu, elems / GRP * 4 + 64);
+    s_cap8 = elems;
+}
+
+// 只做激活量化（不跑 GEMV）：MoE 里 8 个专家的 gate/up 用的是同一份 xb，
+// 量化一次就够。原来每个专家都重新量化一遍 —— 每层白扔十几次内核投递
+//（单次投递实测 8.4 µs，是 8 专家路径的主要开销之一）。
+// elems 必须是 GRP(128) 的整数倍（按 aoff 取用时的组边界才对齐）。
+void k_w4a8_quant(const float* x, long long elems) {
+    if (elems % GRP) { printf("k_w4a8_quant: elems=%lld 不是 %d 的整数倍\n", elems, GRP); exit(1); }
+    w4a8_ensure(elems);
+    static const int noq = getenv("RT_NOQ") ? atoi(getenv("RT_NOQ")) : 0;
+    if (!noq)
+        quant_act<<<dim3((unsigned)(elems / GRP), 1), 32>>>(x, s_ae, s_ao, s_asc, s_asu,
+                                                            1, (int)elems);
+}
+
+// 用「已量化」的激活跑一行 W4A8 GEMV；aoff 是激活元素偏移（GRP 的整数倍）。
+void k_w4a8_run1(float* y, const u32* wq, const float* wsc, int N, int K, long long aoff) {
+    if (aoff % GRP) { printf("k_w4a8_run1: aoff=%lld 不是 %d 的整数倍\n", aoff, GRP); exit(1); }
+    const int nwarp = NTHREADS / 64;
+    const dim3 grid((N + nwarp - 1) / nwarp);
+    gemv_w4a8<1, false, 1><<<grid, NTHREADS>>>(
+        wq, (const uint16_t*)wsc, (const u32*)(s_ae + aoff / 2), (const u32*)(s_ao + aoff / 2),
+        s_asc + aoff / GRP, s_asu + aoff / GRP, y, N, K);
+    if (hipGetLastError() != hipSuccess) { printf("k_w4a8_run1 launch fail\n"); exit(1); }
+}
+
 void k_gemv_w4a8(float* y, const u32* wq, const float* wsc, const float* x, int rows, int N, int K) {
     if (rows > 4) { printf("k_gemv_w4a8: rows=%d > 4（预填充请走 GEMM）\n", rows); exit(1); }
     if (K % GRP) { printf("k_gemv_w4a8: K=%d 不是 %d 的整数倍\n", K, GRP); exit(1); }
     const long long need = (long long)rows * K;
-    if (need > s_cap8) {
-        if (s_ae) hipFree(s_ae);
-        if (s_ao) hipFree(s_ao);
-        if (s_asc) hipFree(s_asc);
-        if (s_asu) hipFree(s_asu);
-        hipMalloc(&s_ae, need / 2 + 64);
-        hipMalloc(&s_ao, need / 2 + 64);
-        hipMalloc(&s_asc, (size_t)rows * (K / GRP) * 4 + 64);
-        hipMalloc(&s_asu, (size_t)rows * (K / GRP) * 4 + 64);
-        s_cap8 = need;
-    }
+    w4a8_ensure(need);
     // RT_NOQ=1 只用于计时对照：跳过量化内核（结果是错的，只回答「这些启动值多少时间」）
     static const int noq = getenv("RT_NOQ") ? atoi(getenv("RT_NOQ")) : 0;
     if (!noq) quant_act<<<dim3(K / GRP, rows), 32>>>(x, s_ae, s_ao, s_asc, s_asu, rows, K);

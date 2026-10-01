@@ -59,6 +59,10 @@ int       g_next = 0;
 
 std::mutex g_mtx;
 
+// 内核投递计数（诊断用：每 token 的投递次数 × 单次投递成本 = 解码瓶颈）。
+unsigned long long g_launch_n = 0;
+extern "C" unsigned long long hsart_launch_count() { return g_launch_n; }
+
 std::vector<std::pair<const void*, size_t>> g_reg;      // 已注册的主机区间
 
 void check_hsa(hsa_status_t st, const char* what) {
@@ -370,6 +374,7 @@ void hsart_dispatch(const RtKernel* k, dim3 grid, dim3 block, int smem,
     hsa_signal_store_screlease(g_queue->doorbell_signal, index);
     g_slot_used[slot] = true;
     g_next = (g_next + 1) % N_SLOT;
+    g_launch_n++;
 }
 
 // ============================ HIP API ============================

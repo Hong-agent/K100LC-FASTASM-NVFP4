@@ -26,6 +26,9 @@ void k_rope(float* q, float* k, const int* pos, int pos0, int n_q, int n_kv, int
 void k_gemv_w4a4(float* y, const u32* wq, const float* wsc, const float* x, int rows, int N, int K);
 // int4 权重 GEMV（W4A8，dot4）：y [rows][N] = W[N][K] · x[rows][K]
 void k_gemv_w4a8(float* y, const u32* wq, const float* wsc, const float* x, int rows, int N, int K);
+// 拆开的两半：先 k_w4a8_quant 量化一次激活，再 k_w4a8_run1 反复跑（MoE 8 专家复用）
+void k_w4a8_quant(const float* x, long long elems);
+void k_w4a8_run1(float* y, const u32* wq, const float* wsc, int N, int K, long long aoff);
 // int4 权重 GEMM（W4A4，预填充）：a 已量化（组优先尺度）
 void k_gemm_i4(float* c, const u32* wq, const float* wsc_gm, const u32* aq, const float* asc_gm,
                int M, int N, int K);
