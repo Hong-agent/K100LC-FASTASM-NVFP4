@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 MODEL_DIR = os.environ.get('Q36_MODEL_DIR',
-                           os.path.join(ROOT, 'models/Qwen3.6-35B-A3B/metadata'))
+                           os.path.join(ROOT, 'models/Qwen3.6-35B-A3B'))
 os.environ.setdefault('RT_MODEL_DIR', MODEL_DIR)          # tools/tok.py 用它找 tokenizer
 
 

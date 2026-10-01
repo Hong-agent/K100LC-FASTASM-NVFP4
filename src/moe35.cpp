@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
@@ -683,7 +685,7 @@ int forward1(Mo35& m, int id) {
         moe(m, il);
         TRACE_SYNC("moe ok");
         if ((il + 1) % 10 == 0 || il == m.cfg.n_layer - 1)
-            printf("   层 %d/%d\n", il + 1, m.cfg.n_layer);
+            fprintf(stderr, "   层 %d/%d\n", il + 1, m.cfg.n_layer);
     }
     k_rmsnorm(m.xb, m.x, (const float*)m.fnorm->p, 1, m.cfg.hidden, m.cfg.eps, false);
     TRACE_SYNC("final norm ok");
@@ -706,13 +708,20 @@ int run_moe35(int argc, char** argv) {
     std::string gguf_path;
     bool load_only = false;
     bool selftest = false;
-    int max_layers = -1, gen_n = 0;
+    bool engine = false;
+    int max_layers = getenv("RT_Q36_MAXLAYERS") ? atoi(getenv("RT_Q36_MAXLAYERS")) : -1;
+    int gen_n = 0;
     std::vector<int> ids;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--gguf" && i + 1 < argc) gguf_path = argv[++i];
+        else if (a == "--model" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v.size() > 5 && v.compare(v.size() - 5, 5, ".gguf") == 0) gguf_path = v;
+        }
         else if (a == "--load-only") load_only = true;
         else if (a == "--q8-selftest") selftest = true;
+        else if (a == "--engine") engine = true;
         else if (a == "--max-layers" && i + 1 < argc) max_layers = atoi(argv[++i]);
         else if (a == "--gen" && i + 1 < argc) gen_n = atoi(argv[++i]);
         else if (a == "--ids" && i + 1 < argc) {
@@ -812,6 +821,58 @@ int run_moe35(int argc, char** argv) {
     }
     bind(m);
     alloc_bufs(m);
+    if (engine) {
+        // 引擎协议（serve.py / chat.py 用）：PREFILL / GEN / MTP / RESET / QUIT
+        printf("READY\n");
+        fflush(stdout);
+        std::string line;
+        int last = -1;
+        while (std::getline(std::cin, line)) {
+            std::string op = line, arg;
+            const size_t sp = line.find(' ');
+            if (sp != std::string::npos) { op = line.substr(0, sp); arg = line.substr(sp + 1); }
+            if (op == "QUIT") break;
+            if (op == "RESET") {
+                m.seq_len = 0; last = -1;
+                printf("OK reset\n");
+            } else if (op == "MTP") {
+                printf("OK mtp 0 (MoE 路径暂未接 MTP)\n");
+            } else if (op == "PREFILL" || op == "PREFILL_NR") {
+                std::vector<int> ids2;
+                for (size_t p = 0; p < arg.size();) {
+                    size_t q = arg.find(',', p);
+                    if (q == std::string::npos) q = arg.size();
+                    ids2.push_back(atoi(arg.substr(p, q - p).c_str()));
+                    p = q + 1;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int id : ids2) last = forward1(m, id);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                printf("OK prefill total=%zu computed=%zu reused=0 mode=fresh ms=%.1f tps=%.1f\n",
+                       ids2.size(), ids2.size(), ms,
+                       ms > 0 ? ids2.size() * 1000.0 / ms : 0.0);
+            } else if (op == "GEN") {
+                int n = atoi(arg.c_str());
+                if (n <= 0) n = 1;
+                if (last < 0) { printf("ERR no logits\n"); fflush(stdout); continue; }
+                for (int i = 0; i < n; i++) {
+                    last = forward1(m, last);
+                    printf("TOK %d\n", last);
+                    fflush(stdout);
+                }
+                printf("END length=%d\n", n);
+            } else if (op == "IMG_EMB" || op == "PREFILL_EMB") {
+                printf("ERR 视觉/embedding 覆盖尚未接入这条路径\n");
+            } else if (op == "STOP") {
+                /* 忽略 */
+            } else {
+                printf("OK %s\n", op.c_str());
+            }
+            fflush(stdout);
+        }
+        return 0;
+    }
     if (ids.empty()) return 0;
     printf("=== 前向 ===\n");
     int last = -1;

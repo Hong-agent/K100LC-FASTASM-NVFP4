@@ -28,8 +28,9 @@ CTX="${CTX:-40960}"
 if [ -z "${MTP_N:-}" ]; then
   if [ "${RT_INT4_NATIVE:-1}" = "0" ]; then MTP_N=3; else MTP_N=0; fi
 fi
-PIDFILE="$RT_ROOT/build/serve.pid"
-LOGFILE="$RT_ROOT/build/serve.log"
+# RT_SERVE_TAG 可以让同一个目录里再起一份独立的服务（不同模型/端口各一套 pid/log）
+PIDFILE="$RT_ROOT/build/serve${RT_SERVE_TAG:-}.pid"
+LOGFILE="$RT_ROOT/build/serve${RT_SERVE_TAG:-}.log"
 NO_MTP_FLAG=""
 [ "${NO_MTP:-0}" != "0" ] && NO_MTP_FLAG="--no-mtp"
 
