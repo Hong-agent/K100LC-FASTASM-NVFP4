@@ -26,6 +26,22 @@
 #include <string>
 #include <vector>
 
+// 分段计时（RT_Q36_PROF=1）
+struct Prof {
+    double attn = 0, moe = 0, head = 0, embed = 0;
+    long long n = 0;
+    void add(double& slot, std::chrono::steady_clock::time_point t0) {
+        slot += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+    }
+    void report() {
+        if (!n) return;
+        fprintf(stderr, "/token: attn=%.1fms moe=%.1fms head=%.1fms embed=%.1fms (%.1fms/token, n=%lld)\n",
+                attn / n, moe / n, head / n, embed / n,
+                (attn + moe + head + embed) / n, n);
+    }
+};
+
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
     printf("HIP ERR %s @%d: %s\n", #x, __LINE__, hipGetErrorString(e_)); exit(1);} } while (0)
 
@@ -382,13 +398,29 @@ struct Mo35 {
     std::vector<float*> conv_state, ssm_state;
     int seq_len = 0, max_ctx = 40960, TP = 64, BM = 64;
     int n_partial = 0;
+    // 批量校验（M = K+1 ≤ 4 行）的缓冲
+    float *h_last = nullptr;                    // 主模型最近一次的位置 hidden（MTP 草拟用）
+    float *xr = nullptr, *xbr = nullptr, *qfull_r = nullptr, *hq_r = nullptr,
+          *hgate_r = nullptr, *hkk_r = nullptr, *hvv_r = nullptr, *hout_r = nullptr,
+          *tmp_r = nullptr, *z_r = nullptr, *qkv_r = nullptr, *conv_r = nullptr,
+          *gq_r = nullptr, *gk_r = nullptr, *gv_r = nullptr, *gab_r = nullptr,
+          *gbeta_r = nullptr, *gg_r = nullptr, *g_r = nullptr, *u_r = nullptr,
+          *d_r = nullptr, *router_r = nullptr, *shexp_r = nullptr, *acc_r = nullptr,
+          *logits_r = nullptr, *convprev_r = nullptr;
+    u32* ids_exp = nullptr;                    // 每 (行,槽) 的专家号表
+    u32* snap_mtp_kc = nullptr;                // MTP KV 快照（回滚用）
+    int* d_arg = nullptr;                      // 批量 argmax 输出
+    std::vector<float*> snap_list_conv, snap_list_ssm;   // 每层的逐 token 快照槽
+    std::vector<float*> snap_conv_A, snap_ssm_A;         // 批量前的整层快照
     VisionModel vis;
     bool vision_on = false;
     std::vector<float> emb_override;      // 图片 embedding（[rows][H]）
     std::map<int, int> emb_rows;          // 位置 → emb_override 的行号
+    Prof prof;
     bool mtp_enabled = false;
     int draft = -1;
     long long mtp_try = 0, mtp_hit = 0;
+    int mtp_k = 3;                              // 投机草稿数（1..3）
 
     float* alloc(int n) {
         float* p = nullptr;
@@ -607,6 +639,38 @@ void alloc_bufs(Mo35& m) {
         } else {
             m.conv_state[il] = m.alloc((c.conv_k - 1) * C);
             m.ssm_state[il] = m.alloc(c.lv_head * c.ldim * c.ldim);
+        }
+    }
+    // 批量校验缓冲（M4 = 4 行）
+    {
+        const int M4 = 4;
+        const int C = qn * 2 + vn;
+        m.h_last = m.alloc(H);
+        m.xr = m.alloc(M4 * H); m.xbr = m.alloc(M4 * H);
+        m.qfull_r = m.alloc(M4 * pd); m.hq_r = m.alloc(M4 * qd); m.hgate_r = m.alloc(M4 * qd);
+        m.hkk_r = m.alloc(M4 * KV * D); m.hvv_r = m.alloc(M4 * KV * D);
+        m.hout_r = m.alloc(M4 * qd); m.tmp_r = m.alloc(M4 * std::max(H, vn));
+        m.z_r = m.alloc(M4 * vn); m.qkv_r = m.alloc(M4 * C); m.conv_r = m.alloc(M4 * C);
+        m.gq_r = m.alloc(M4 * qn); m.gk_r = m.alloc(M4 * qn); m.gv_r = m.alloc(M4 * vn);
+        m.gab_r = m.alloc(M4 * 2 * c.lv_head); m.gbeta_r = m.alloc(M4 * c.lv_head);
+        m.gg_r = m.alloc(M4 * c.lv_head);
+        m.g_r = m.alloc(M4 * c.top_k * MI); m.u_r = m.alloc(M4 * c.top_k * MI);
+        m.d_r = m.alloc(M4 * c.top_k * H);
+        m.router_r = m.alloc(M4 * E); m.shexp_r = m.alloc(M4);
+        m.acc_r = m.alloc(M4 * H);
+        m.convprev_r = m.alloc((c.conv_k - 1) * C);
+        CK(hipMalloc(&m.ids_exp, (size_t)M4 * c.top_k * 4));
+        CK(hipMalloc(&m.d_arg, (size_t)M4 * 4));
+        m.snap_mtp_kc = m.alloc_u32(c.n_kv * m.max_ctx * (D / KVEL));
+        // 每层状态快照（投机解码被拒时要回滚）
+        for (int il = 0; il < c.n_layer; il++) {
+            m.snap_conv_A.push_back(c.is_full(il) ? nullptr : m.alloc((c.conv_k - 1) * C));
+            m.snap_ssm_A.push_back(c.is_full(il) ? nullptr : m.alloc(c.lv_head * c.ldim * c.ldim));
+            if (c.is_full(il)) { m.snap_list_conv.push_back(nullptr); m.snap_list_ssm.push_back(nullptr); }
+            else {
+                m.snap_list_conv.push_back(m.alloc(4 * (c.conv_k - 1) * C));
+                m.snap_list_ssm.push_back(m.alloc(4 * c.lv_head * c.ldim * c.ldim));
+            }
         }
     }
     printf("激活/KV 缓冲就绪（max_ctx=%d）\n", m.max_ctx);
@@ -924,6 +988,272 @@ void attn_lin(Mo35& m, int il) {
 }
 
 // MTP 草稿：输入「刚生成的 token + 主模型该位置的 hidden」，输出下一个 token 的草稿
+// ======================= 批量校验前向（M = K+1 ≤ 4 行）=======================
+// 关键技巧：q8_0_dot_k 的「专家组」参数可以把「行号」编进块号，
+// 于是 M 行的线性层只读一遍权重 —— 这是投机解码能加速的根本。
+uint32_t* ids_zero4() {
+    static uint32_t* p = nullptr;
+    if (!p) {
+        CK(hipMalloc(&p, 16));
+        uint32_t z[4] = {0, 0, 0, 0};
+        CK(hipMemcpy(p, z, 16, hipMemcpyHostToDevice));
+    }
+    return p;
+}
+
+// y[M][N] = x[M][K] · W[N][K]^T
+void linear_q8_rows(Mo35& m, float* y, const DevTensor* t, const float* x, int M,
+                    int expert = -1) {
+    const int K = (int)t->dims[0];
+    const int N = t->dims.size() > 1 ? (int)t->dims[1] : 1;
+    const int nbpr = K / 32;
+    const void* p = t->p;
+    if (expert >= 0 && t->dims.size() > 2)
+        p = (const uint8_t*)p + (long long)expert * N * nbpr * 34;
+    k_q8_dot(p, x, m.partial, M * N * nbpr, nbpr, N, ids_zero4(), 0u, N);
+    k_reduce(m.partial, y, M * N, nbpr);
+}
+
+// 专家批量：[M][TOP] 个输出行，x 每行被 TOP 个输出行共用
+void linear_q8_experts(Mo35& m, float* y, const DevTensor* t, const float* x, int M,
+                       int TOP, int rpe_x) {
+    const int K = (int)t->dims[0];
+    const int N = (int)t->dims[1];
+    const int nbpr = K / 32;
+    const long long estr = (long long)N * nbpr * 34;
+    const int total = M * TOP * N;
+    k_q8_dot(t->p, x, m.partial, total * nbpr, nbpr, rpe_x, m.ids_exp, (uint32_t)estr, N);
+    k_reduce(m.partial, y, total, nbpr);
+}
+
+// MoE：逐行路由 + 批量专家（权重只读一遍）
+void moe_apply_rows(Mo35& m, const Mo35::L& L, float* x, int M) {
+    const Cfg35& c = m.cfg;
+    const int H = c.hidden, MI = c.moe_inter, E = c.n_expert, TOP = c.top_k;
+    k_rmsnorm(m.xbr, x, (const float*)L.post_ln->p, M, H, c.eps, false);
+    for (int r = 0; r < M; r++) {
+        lin_f32(m, m.router_r + (size_t)r * E, L.ginp, m.xbr + (size_t)r * H);
+        lin_f32(m, m.shexp_r + r, L.gshexp, m.xbr + (size_t)r * H);
+    }
+    std::vector<float> rout((size_t)M * E), sgate((size_t)M);
+    CK(hipMemcpy(rout.data(), m.router_r, rout.size() * 4, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(sgate.data(), m.shexp_r, sgate.size() * 4, hipMemcpyDeviceToHost));
+    std::vector<uint32_t> ids((size_t)M * TOP);
+    std::vector<float> wts((size_t)M * TOP);
+    for (int r = 0; r < M; r++) {
+        float* row = rout.data() + (size_t)r * E;
+        float mx = row[0];
+        for (int i = 1; i < E; i++) mx = std::max(mx, row[i]);
+        double sum = 0;
+        for (int i = 0; i < E; i++) { row[i] = expf(row[i] - mx); sum += row[i]; }
+        std::vector<int> idx((size_t)E);
+        for (int i = 0; i < E; i++) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + TOP, idx.end(),
+                          [&](int a, int b) { return row[a] > row[b]; });
+        double ws = 0;
+        for (int k = 0; k < TOP; k++) ws += row[idx[k]];
+        if (ws <= 0) ws = 1;
+        for (int k = 0; k < TOP; k++) {
+            ids[(size_t)r * TOP + k] = (uint32_t)idx[k];
+            wts[(size_t)r * TOP + k] = (float)(row[idx[k]] / ws);
+        }
+    }
+    CK(hipMemcpy(m.ids_exp, ids.data(), ids.size() * 4, hipMemcpyHostToDevice));
+    // 共享专家（批量）
+    linear_q8_rows(m, m.g_r, L.sgate, m.xbr, M);
+    linear_q8_rows(m, m.u_r, L.sup, m.xbr, M);
+    k_silu_mul(m.g_r, m.g_r, m.u_r, M * MI);
+    linear_q8_rows(m, m.tmp_r, L.sdown, m.g_r, M);
+    // 专家（批量：M*TOP 行一次算完）
+    linear_q8_experts(m, m.g_r, L.gexp, m.xbr, M, TOP, TOP * MI);
+    linear_q8_experts(m, m.u_r, L.uexp, m.xbr, M, TOP, TOP * MI);
+    k_silu_mul(m.g_r, m.g_r, m.u_r, M * TOP * MI);
+    linear_q8_experts(m, m.d_r, L.dexp, m.g_r, M, TOP, H);
+    // 加权合并（主机侧，M*TOP*H 只有 4*8*2048 个数）
+    std::vector<float> dr((size_t)M * TOP * H), sd((size_t)M * H);
+    CK(hipMemcpy(dr.data(), m.d_r, dr.size() * 4, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(sd.data(), m.tmp_r, sd.size() * 4, hipMemcpyDeviceToHost));
+    std::vector<float> acc((size_t)M * H);
+    for (int r = 0; r < M; r++) {
+        const float sg = 1.f / (1.f + expf(-sgate[r]));
+        for (int d = 0; d < H; d++) {
+            double v = sg * (double)sd[(size_t)r * H + d];
+            for (int k = 0; k < TOP; k++)
+                v += (double)wts[(size_t)r * TOP + k] * dr[((size_t)r * TOP + k) * H + d];
+            acc[(size_t)r * H + d] = (float)v;
+        }
+    }
+    CK(hipMemcpy(m.acc_r, acc.data(), acc.size() * 4, hipMemcpyHostToDevice));
+    k_add_inplace(x, m.acc_r, M * H);
+}
+
+void moe_rows(Mo35& m, int il, int M) { moe_apply_rows(m, m.Ls[il], m.xr, M); }
+
+// 全注意力（M 行）
+void attn_full_rows(Mo35& m, int il, int M, int pos0) {
+    const Cfg35& c = m.cfg;
+    Mo35::L& L = m.Ls[il];
+    const int Hn = c.n_head, KV = c.n_kv, D = c.head_dim, Hd = c.hidden;
+    const int qd = Hn * D, pd = qd * 2;
+    const int TP = ((M + 63) / 64) * 64;
+    k_rmsnorm(m.xbr, m.xr, (const float*)L.in_ln->p, M, Hd, c.eps, false);
+    linear_q8_rows(m, m.qfull_r, L.q, m.xbr, M);
+    linear_q8_rows(m, m.hkk_r, L.k, m.xbr, M);
+    linear_q8_rows(m, m.hvv_r, L.v, m.xbr, M);
+    k_gather_heads(m.hq_r, m.qfull_r, M, Hn, D, pd, 0, 2 * D);
+    k_gather_heads(m.hgate_r, m.qfull_r, M, Hn, D, pd, D, 2 * D);
+    k_rmsnorm(m.hq_r, m.hq_r, (const float*)L.qnorm->p, M * Hn, D, c.eps, false);
+    k_rmsnorm(m.hkk_r, m.hkk_r, (const float*)L.knorm->p, M * KV, D, c.eps, false);
+    k_rope(m.hq_r, m.hkk_r, nullptr, pos0, M, M, Hn, KV, D, c.rot, c.rope_theta);
+    k_scale(m.hq_r, 1.f / sqrtf((float)D), (long long)M * qd);
+    k_attn_q_quant(m.qq, m.qs, m.hq_r, M, Hn, D, 128, TP);
+    k_kv_append_k(m.kc[il], m.ksc[il], m.hkk_r, pos0, M, KV, D, 128, m.max_ctx);
+    k_kv_append_v(m.vc[il], m.vsc[il], m.vstage[il], m.hvv_r, pos0, M, KV, D, 64, m.max_ctx);
+    const int n_kv = pos0 + M;
+    k_attention(m.hfa, m.qq, m.qs, m.kc[il], m.ksc[il], m.vc[il], m.vsc[il],
+                TP, M, n_kv, pos0, (n_kv + 63) / 64, Hn, Hn / KV, m.max_ctx,
+                m.pout, m.pmax, m.psum, 8);
+    k_scatter_heads(m.hout_r, m.hfa, M, Hn, D, qd, 0, TP);
+    k_sigmoid_mul(m.hout_r, m.hout_r, m.hgate_r, M * qd);
+    linear_q8_rows(m, m.tmp_r, L.o, m.hout_r, M);
+    k_add_inplace(m.xr, m.tmp_r, M * Hd);
+}
+
+// 线性注意力（M 行）
+void attn_lin_rows(Mo35& m, int il, int M, int pos0, bool snap = true) {
+    (void)pos0;
+    const Cfg35& c = m.cfg;
+    Mo35::L& L = m.Ls[il];
+    const int Hd = c.hidden, Hk = c.lk_head, Hv = c.lv_head, D = c.ldim;
+    const int qn = Hk * D, vn = Hv * D, C = qn * 2 + vn, K = c.conv_k;
+    k_rmsnorm(m.xbr, m.xr, (const float*)L.in_ln->p, M, Hd, c.eps, false);
+    linear_q8_rows(m, m.qkv_r, L.qkv, m.xbr, M);
+    linear_q8_rows(m, m.z_r, L.z, m.xbr, M);
+    CK(hipMemcpyAsync(m.convprev_r, m.conv_state[il], (size_t)(K - 1) * C * 4,
+                      hipMemcpyDeviceToDevice, 0));
+    k_conv1d_silu(m.conv_r, m.qkv_r, (const float*)L.conv->p, m.convprev_r, M, C, K);
+    if (snap) {
+        k_conv_state_update_snap(m.conv_state[il], m.snap_list_conv[il], m.qkv_r,
+                                 m.convprev_r, M, C, K);
+    } else {
+        k_conv_state_update(m.conv_state[il], m.qkv_r, m.convprev_r, M, C, K);
+    }
+    k_split_qkv(m.gq_r, m.gk_r, m.gv_r, m.conv_r, M, qn, qn, vn);
+    k_l2norm(m.gq_r, M * Hk, D, c.eps);
+    k_l2norm(m.gk_r, M * Hk, D, c.eps);
+    k_ssm_ab_gate(m.gab_r, m.gbeta_r, m.gg_r, L.alpha, L.beta, m.xbr,
+                  (const float*)L.dtb->p, (const float*)L.alog->p, M, Hv, Hd);
+    if (snap) {
+        k_gdn_snap(m.hout_r, m.gq_r, m.gk_r, m.gv_r, m.gg_r, m.gbeta_r,
+                   m.ssm_state[il], m.snap_list_ssm[il], M, Hk, Hv, D, Hv / Hk);
+    } else {
+        k_gdn(m.hout_r, m.gq_r, m.gk_r, m.gv_r, m.gg_r, m.gbeta_r, m.ssm_state[il],
+              M, Hk, Hv, D, Hv / Hk);
+    }
+    k_rmsnorm_gated(m.hout_r, m.hout_r, (const float*)L.snorm->p, m.z_r, M * Hv, D, c.eps);
+    linear_q8_rows(m, m.tmp_r, L.sout, m.hout_r, M);
+    k_add_inplace(m.xr, m.tmp_r, M * Hd);
+}
+
+// 批量前向：ids[M] → 每行 logits 的 argmax（m.d_arg）
+void forward_rows(Mo35& m, const int* ids, int M, int pos0) {
+    const Cfg35& c = m.cfg;
+    for (int r = 0; r < M; r++) embed_row_into(m, ids[r], m.xr + (size_t)r * c.hidden);
+    for (int il = 0; il < c.n_layer; il++) {
+        if (c.is_full(il)) attn_full_rows(m, il, M, pos0);
+        else               attn_lin_rows(m, il, M, pos0);
+        moe_rows(m, il, M);
+    }
+    for (int r = 0; r < M; r++) {
+        k_rmsnorm(m.xbr, m.xr + (size_t)r * c.hidden, (const float*)m.fnorm->p, 1,
+                  c.hidden, c.eps, false);
+        lin_q8(m, m.logits, m.lmhead, m.xbr);
+        int* d1 = m.d_arg + r;
+        k_argmax(m.logits, c.vocab, d1);
+    }
+    CK(hipDeviceSynchronize());
+}
+
+void reset_states(Mo35& m) {
+    for (int il = 0; il < m.cfg.n_layer; il++) {
+        if (m.cfg.is_full(il)) {
+            CK(hipMemset(m.kc[il], 0, (size_t)m.cfg.n_kv * m.max_ctx *
+                                       (m.cfg.head_dim / KVEL) * 4));
+            CK(hipMemset(m.ksc[il], 0, (size_t)m.cfg.n_kv * 2 * m.max_ctx * 4));
+            CK(hipMemset(m.vc[il], 0, (size_t)m.cfg.n_kv * (m.max_ctx / KVEL) *
+                                       m.cfg.head_dim * 4));
+            CK(hipMemset(m.vsc[il], 0, (size_t)m.cfg.n_kv * (m.max_ctx / 64) *
+                                       m.cfg.head_dim * 4));
+            CK(hipMemset(m.vstage[il], 0, (size_t)m.cfg.n_kv * 64 * m.cfg.head_dim * 4));
+        } else {
+            CK(hipMemset(m.conv_state[il], 0, (size_t)(m.cfg.conv_k - 1) *
+                         (m.cfg.lk_head * 2 + m.cfg.lv_head) * m.cfg.ldim * 4));
+            CK(hipMemset(m.ssm_state[il], 0, (size_t)m.cfg.lv_head * m.cfg.ldim *
+                                              m.cfg.ldim * 4));
+        }
+    }
+    if (m.mtp.bound) {
+        CK(hipMemset(m.mtp.kc, 0, (size_t)m.cfg.n_kv * m.max_ctx *
+                                  (m.cfg.head_dim / KVEL) * 4));
+        CK(hipMemset(m.mtp.vc, 0, (size_t)m.cfg.n_kv * (m.max_ctx / KVEL) *
+                                  m.cfg.head_dim * 4));
+        m.mtp.len = 0;
+    }
+    m.seq_len = 0;
+    m.mtp_try = m.mtp_hit = 0;
+    m.draft = -1;
+}
+
+// 状态快照 / 回滚（投机被拒时用）
+void rollback_states(Mo35& m, int j) {
+    const Cfg35& c = m.cfg;
+    const int C = (c.lk_head * 2 + c.lv_head) * c.ldim;
+    const size_t conv_one = (size_t)(c.conv_k - 1) * C;
+    const size_t ssm_one = (size_t)c.lv_head * c.ldim * c.ldim;
+    for (int il = 0; il < c.n_layer; il++) {
+        if (c.is_full(il)) continue;
+        if (j > 0) {          // 逐 token 槽：第 j-1 个 token 之后的状态
+            CK(hipMemcpy(m.conv_state[il], m.snap_list_conv[il] + (size_t)(j - 1) * conv_one,
+                         conv_one * 4, hipMemcpyDeviceToDevice));
+            CK(hipMemcpy(m.ssm_state[il], m.snap_list_ssm[il] + (size_t)(j - 1) * ssm_one,
+                         ssm_one * 4, hipMemcpyDeviceToDevice));
+        } else {              // 全部拒绝：回到批量前的快照
+            CK(hipMemcpy(m.conv_state[il], m.snap_conv_A[il], conv_one * 4,
+                         hipMemcpyDeviceToDevice));
+            CK(hipMemcpy(m.ssm_state[il], m.snap_ssm_A[il], ssm_one * 4,
+                         hipMemcpyDeviceToDevice));
+        }
+    }
+}
+
+void snap_states(Mo35& m, int M_rows) {
+    (void)M_rows;
+    const Cfg35& c = m.cfg;
+    const int C = (c.lk_head * 2 + c.lv_head) * c.ldim;
+    for (int il = 0; il < c.n_layer; il++) {
+        if (c.is_full(il)) continue;
+        CK(hipMemcpy(m.snap_conv_A[il], m.conv_state[il],
+                     (size_t)(c.conv_k - 1) * C * 4, hipMemcpyDeviceToDevice));
+        CK(hipMemcpy(m.snap_ssm_A[il], m.ssm_state[il],
+                     (size_t)c.lv_head * c.ldim * c.ldim * 4, hipMemcpyDeviceToDevice));
+    }
+    if (m.mtp.bound)
+        CK(hipMemcpy(m.snap_mtp_kc, m.mtp.kc, (size_t)c.n_kv * m.max_ctx *
+                     (c.head_dim / KVEL) * 4, hipMemcpyDeviceToDevice));
+}
+
+void restore_states(Mo35& m) {
+    const Cfg35& c = m.cfg;
+    const int C = (c.lk_head * 2 + c.lv_head) * c.ldim;
+    for (int il = 0; il < c.n_layer; il++) {
+        if (c.is_full(il)) continue;
+        CK(hipMemcpy(m.conv_state[il], m.snap_list_conv[il],
+                     (size_t)(c.conv_k - 1) * C * 4, hipMemcpyDeviceToDevice));
+        CK(hipMemcpy(m.ssm_state[il], m.snap_list_ssm[il],
+                     (size_t)c.lv_head * c.ldim * c.ldim * 4, hipMemcpyDeviceToDevice));
+    }
+}
+
 int mtp_draft(Mo35& m, int last_id, const float* hidden) {
     MtpW& t = m.mtp;
     if (!t.bound) return -1;
@@ -975,8 +1305,55 @@ int mtp_draft(Mo35& m, int last_id, const float* hidden) {
     return id;
 }
 
+int forward1(Mo35& m, int id);      // 声明（decode_step 先用到）
+
+// MTP 链式草拟：K 步串行（第 i 步用上一轮的 MTP 隐藏态）
+void mtp_chain(Mo35& m, int first_token, int K, int* out) {
+    const float* h = m.h_last;
+    int tok = first_token;
+    for (int i = 0; i < K; i++) {
+        out[i] = mtp_draft(m, tok, h);
+        h = m.xb;                      // mtp_draft 末尾把 normed 输出留在 m.xb
+        tok = out[i];
+    }
+}
+
+// 投机解码一步：处理 cur，返回本轮产出的 token（1 ~ K+1 个）
+// 不变量：返回后 KV 覆盖到「倒数第二个输出 token」的位置，最后一个待处理
+std::vector<int> decode_step(Mo35& m, int cur, int K) {
+    std::vector<int> out;
+    const int pred = forward1(m, cur);          // KV 覆盖…位置 p；pred = p+1 的预测
+    if (K <= 0 || !m.mtp.bound || !m.mtp_enabled) { out.push_back(pred); return out; }
+    const int mtp_len0 = m.mtp.len;
+    int drafts[4] = {0, 0, 0, 0};
+    mtp_chain(m, cur, K, drafts);
+    if (drafts[0] != pred) {                    // 第一个就拒：草稿全弃
+        m.mtp.len = mtp_len0;
+        out.push_back(pred);
+        return out;
+    }
+    // 批量校验 drafts[0..K-1]（pos0 = m.seq_len = p+1）
+    snap_states(m, K);
+    forward_rows(m, drafts, K, m.seq_len);
+    int arg[4] = {-1, -1, -1, -1};
+    CK(hipMemcpy(arg, m.d_arg, (size_t)K * 4, hipMemcpyDeviceToHost));
+    int j = 1;
+    while (j < K && arg[j - 1] == drafts[j]) j++;
+    const int next = arg[j - 1];                // 第 j 个草稿之后的修正/bonus token
+    rollback_states(m, j);
+    m.seq_len += j;                             // KV 现在覆盖到 p+j
+    m.mtp.len = mtp_len0 + j;
+    for (int i = 0; i < j; i++) out.push_back(drafts[i]);
+    out.push_back(next);
+    if (getenv("RT_Q36_SPEC"))
+        fprintf(stderr, "  投机：草稿 %d 接受 %d → 本轮出 %zu token\\n", K, j, out.size());
+    return out;
+}
+
 int forward1(Mo35& m, int id) {
     STEP("forward1: embed");
+    const bool prof = getenv("RT_Q36_PROF") != nullptr;
+    auto tick = std::chrono::steady_clock::now();
     auto it = m.emb_rows.find(m.seq_len);
     if (it != m.emb_rows.end()) {
         CK(hipMemcpy(m.x, m.emb_override.data() + (size_t)it->second * m.cfg.hidden,
@@ -1003,12 +1380,15 @@ int forward1(Mo35& m, int id) {
         for (float v : h) { s += (double)v * v; if (fabs(v) > mx) mx = fabs(v); }
         fprintf(stderr, "   EMB  rms=%.4f max=%.3f first=%.4f\n", sqrt(s / m.cfg.hidden), mx, h[0]);
     }
+    if (prof) { m.prof.add(m.prof.embed, tick); tick = std::chrono::steady_clock::now(); }
     for (int il = 0; il < m.cfg.n_layer; il++) {
         if (m.cfg.is_full(il)) attn_full(m, il);
         else                   attn_lin(m, il);
+        if (prof) { m.prof.add(m.prof.attn, tick); tick = std::chrono::steady_clock::now(); }
         TRACE_SYNC("attn ok");
         dumpx("%s/L%d_mix.f32", il);
         moe(m, il);
+        if (prof) { m.prof.add(m.prof.moe, tick); tick = std::chrono::steady_clock::now(); }
         TRACE_SYNC("moe ok");
         dumpx("%s/L%d_out.f32", il);
         dumpx("%s/L%d_in.f32", il + 1);
@@ -1024,10 +1404,12 @@ int forward1(Mo35& m, int id) {
         if ((il + 1) % 10 == 0 || il == m.cfg.n_layer - 1)
             fprintf(stderr, "   层 %d/%d\n", il + 1, m.cfg.n_layer);
     }
+    CK(hipMemcpy(m.h_last, m.x, (size_t)m.cfg.hidden * 4, hipMemcpyDeviceToDevice));
     if (m.mtp.bound && m.mtp_enabled) m.draft = mtp_draft(m, id, m.x);
     k_rmsnorm(m.xb, m.x, (const float*)m.fnorm->p, 1, m.cfg.hidden, m.cfg.eps, false);
     TRACE_SYNC("final norm ok");
     lin_q8(m, m.logits, m.lmhead, m.xb);
+    if (prof) { m.prof.add(m.prof.head, tick); m.prof.n++; }
     TRACE_SYNC("lm_head ok");
     int* d_best = nullptr;
     CK(hipMalloc(&d_best, 4));
@@ -1061,7 +1443,8 @@ int run_moe35(int argc, char** argv) {
     bool selftest = false;
     bool engine = false;
     int max_layers = getenv("RT_Q36_MAXLAYERS") ? atoi(getenv("RT_Q36_MAXLAYERS")) : -1;
-    int gen_n = 0, mtp_n = 0;
+    int gen_n = 0, mtp_n = 0, mtp_k = 3;
+    bool check_rows = getenv("RT_Q36_CHECKROWS") != nullptr;
     std::vector<int> ids;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1076,6 +1459,7 @@ int run_moe35(int argc, char** argv) {
         else if (a == "--max-layers" && i + 1 < argc) max_layers = atoi(argv[++i]);
         else if (a == "--gen" && i + 1 < argc) gen_n = atoi(argv[++i]);
         else if (a == "--mtp" && i + 1 < argc) mtp_n = atoi(argv[++i]);
+        else if (a == "--mtp-k" && i + 1 < argc) mtp_k = atoi(argv[++i]);
         else if (a == "--ids" && i + 1 < argc) {
             std::string s = argv[++i];
             for (size_t p = 0; p < s.size();) {
@@ -1174,6 +1558,7 @@ int run_moe35(int argc, char** argv) {
     bind(m);
     alloc_bufs(m);
     bind_mtp(m);
+    m.mtp_k = std::max(1, std::min(3, mtp_k));
     if (mtp_n > 0) m.mtp_enabled = m.mtp.bound;
     {
         const char* env = getenv("RT_VISION_RT4");
@@ -1199,28 +1584,9 @@ int run_moe35(int argc, char** argv) {
             if (sp != std::string::npos) { op = line.substr(0, sp); arg = line.substr(sp + 1); }
             if (op == "QUIT") break;
             if (op == "RESET") {
-                // 常驻引擎必须把状态清干净：KV / 卷积状态 / SSM 递推状态
-                for (int il = 0; il < m.cfg.n_layer; il++) {
-                    if (m.cfg.is_full(il)) {
-                        CK(hipMemset(m.kc[il], 0, (size_t)m.cfg.n_kv * m.max_ctx *
-                                                   (m.cfg.head_dim / KVEL) * 4));
-                        CK(hipMemset(m.ksc[il], 0, (size_t)m.cfg.n_kv * 2 * m.max_ctx * 4));
-                        CK(hipMemset(m.vc[il], 0, (size_t)m.cfg.n_kv *
-                                                   (m.max_ctx / KVEL) * m.cfg.head_dim * 4));
-                        CK(hipMemset(m.vsc[il], 0, (size_t)m.cfg.n_kv *
-                                                   (m.max_ctx / 64) * m.cfg.head_dim * 4));
-                        CK(hipMemset(m.vstage[il], 0, (size_t)m.cfg.n_kv * 64 *
-                                                      m.cfg.head_dim * 4));
-                    } else {
-                        CK(hipMemset(m.conv_state[il], 0,
-                                     (size_t)(m.cfg.conv_k - 1) *
-                                     (m.cfg.lk_head * 2 + m.cfg.lv_head) * m.cfg.ldim * 4));
-                        CK(hipMemset(m.ssm_state[il], 0, (size_t)m.cfg.lv_head *
-                                                         m.cfg.ldim * m.cfg.ldim * 4));
-                    }
-                }
-                m.seq_len = 0; last = -1;
-                m.mtp.len = 0; m.mtp_try = m.mtp_hit = 0; m.draft = -1;
+                reset_states(m);
+                last = -1;
+                printf("OK reset\n");                m.mtp.len = 0; m.mtp_try = m.mtp_hit = 0; m.draft = -1;
                 printf("OK reset\n");
             } else if (op == "MTP") {
                 const int k = atoi(arg.c_str());
@@ -1329,6 +1695,50 @@ int run_moe35(int argc, char** argv) {
         }
         return 0;
     }
+    if (getenv("RT_Q36_BENCH")) {
+        const int it = atoi(getenv("RT_Q36_BENCH"));
+        auto bench = [&](const char* tag, const DevTensor* t, int expert, float* out) {
+            const int N = (int)t->dims[1], K = (int)t->dims[0];
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < it; i++) lin_q8(m, out, t, m.xb, expert);
+            CK(hipDeviceSynchronize());
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count() / it;
+            printf("%-28s N=%-6d K=%-6d  %.1f µs/次  %.1f GB/s\n", tag, N, K, ms * 1000,
+                   (double)N * K * 1.0625 / (ms / 1000) / 1e9);
+        };
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; i++) lin_f32(m, m.router, m.Ls[0].ginp, m.xb);
+        CK(hipDeviceSynchronize());
+        printf("%-28s N=%-6d K=%-6d  %.1f µs/次\n", "router(f32 256x2048)", 256, 2048,
+               std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count() / it * 1000);
+        bench("attn_qkv(8192x2048)", m.Ls[0].qkv, -1, m.qfull);
+        bench("attn_q(8192x2048)", m.Ls[3].q, -1, m.qfull);
+        bench("ssm_out(2048x4096)", m.Ls[0].sout, -1, m.tmp);
+        bench("expert_gate(512x2048)", m.Ls[0].gexp, 0, m.gbuf);
+        bench("expert_down(2048x512)", m.Ls[0].dexp, 0, m.dbuf);
+        bench("lm_head(248320x2048)", m.lmhead, -1, m.logits);
+        return 0;
+    }
+    if (check_rows) {
+        const int M = (int)std::min<size_t>(ids.size(), 4);
+        reset_states(m);
+        forward_rows(m, ids.data(), M, 0);
+        std::vector<int> bat(M);
+        CK(hipMemcpy(bat.data(), m.d_arg, (size_t)M * 4, hipMemcpyDeviceToHost));
+        reset_states(m);
+        std::vector<int> seq(M);
+        for (int r = 0; r < M; r++) seq[r] = forward1(m, ids[r]);
+        int bad = 0;
+        for (int r = 0; r < M; r++) {
+            printf("  row %d: 批量=%d 逐token=%d %s\n", r, bat[r], seq[r],
+                   bat[r] == seq[r] ? "✓" : "✗");
+            if (bat[r] != seq[r]) bad++;
+        }
+        printf("批量校验对拍：%d/%d 一致\n", M - bad, M);
+        return bad ? 1 : 0;
+    }
     if (ids.empty()) return 0;
     printf("=== 前向 ===\n");
     int last = -1;
@@ -1340,16 +1750,26 @@ int run_moe35(int argc, char** argv) {
     }
     if (last >= 0) printf("TOKEN %d\n", last);
     fflush(stdout);
-    for (int i = 0; i < gen_n; i++) {
-        const int64_t t0 = (int64_t)time(nullptr);
-        last = forward1(m, last);
-        printf("TOKEN %d\n", last);
-        fflush(stdout);
-        fprintf(stderr, "  gen %d → %d（%.1fs）\n", i, last,
-                (double)((int64_t)time(nullptr) - t0));
+    {
+        int produced = 0;
+        while (produced < gen_n) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<int> o = decode_step(m, last, m.mtp_enabled ? m.mtp_k : 0);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+            for (int tk : o) {
+                if (produced++ >= gen_n) break;
+                printf("TOKEN %d\n", tk);
+                fflush(stdout);
+                last = tk;
+            }
+            fprintf(stderr, "  gen %d/%d，本轮 %zu token（%.0f ms，%.0f ms/token）\n",
+                    produced, gen_n, o.size(), ms, ms / (double)o.size());
+        }
     }
     if (m.mtp_try)
         fprintf(stderr, "MTP 统计：草稿 %lld，命中 %lld（%.1f%%）\n",
                 m.mtp_try, m.mtp_hit, 100.0 * m.mtp_hit / m.mtp_try);
+    m.prof.report();
     return 0;
 }
