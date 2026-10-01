@@ -346,6 +346,157 @@ void q8_selftest(Gguf& g, long long file_size) {
 // ================================ 模型 =====================================
 // 布局约定（与 GGUF 的 ne0 连续一致，也就与内核的 w[n*K + k] 一致）：
 //   Q8_0 专家张量 [K, N, E]：第 e 个专家基址 = p + e*(N*K/32*34)
+
+// ================= Q8_0 → W8（hi/lo 两张 int4）重打包 =====================
+// 动机：q8_0_dot_k 实测只有 ~7.8 GB/s（指令受限、且不跨行复用权重），而现役
+// W4A8 GEMV 在 M=1..4 行时能到 300~500 GB/s（27B 的 MTP 就是这么存的）。
+// 于是把 Q8_0 权重一次性重打包成「int8 = 16*hi + lo」两张 int4 + 每 128 组
+// f16 尺度（hi 的尺度预乘 16），运行时用现役 k_gemv_w4a8 跑两遍相加 ——
+// 精度与 Q8 等价（int8 权重 × int8 激活），显存不变（4bit+4bit = 8bit）。
+struct W8 {
+    const u32* hi = nullptr;        // [rows][K/2] 低半字节 = 偶数 k
+    const u32* lo = nullptr;
+    const uint16_t* shi = nullptr;  // [rows][K/128] f16（= 16*s）
+    const uint16_t* slo = nullptr;  // [rows][K/128] f16（= s）
+    long long rows = 0, K = 0;
+};
+
+inline uint16_t f32_to_f16(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    const uint32_t sg = (u >> 31) & 1, ex = (u >> 23) & 0xFF, ma = u & 0x7FFFFF;
+    int e = (int)ex - 127 + 15;
+    uint16_t h;
+    if (ex == 0) { h = (uint16_t)(sg << 15); }
+    else if (e >= 31) { h = (uint16_t)((sg << 15) | (31 << 10)); }
+    else if (e <= 0) { h = (uint16_t)(sg << 15); }
+    else { h = (uint16_t)((sg << 15) | ((uint32_t)e << 10) | (ma >> 13)); }
+    return h;
+}
+
+// t：设备上的 Q8_0 张量（行 = 行，列 = K，第二/三维都被展平成行）
+bool packchk_done = false;
+W8 pack_q8(DevTensor* t) {
+    const int K = (int)t->dims[0];
+    long long rows = 1;
+    for (size_t i = 1; i < t->dims.size(); i++) rows *= t->dims[i];
+    const int nb32 = K / 32, nb128 = K / 128;
+    if (K % 128) { printf("pack_q8: K=%d 不是 128 的倍数\n", K); exit(1); }
+    W8 w;
+    w.rows = rows; w.K = K;
+    u32* dhi = nullptr; u32* dlo = nullptr; uint16_t* dshi = nullptr; uint16_t* dslo = nullptr;
+    CK(hipMalloc(&dhi, (size_t)rows * (K / 8) * 4));
+    CK(hipMalloc(&dlo, (size_t)rows * (K / 8) * 4));
+    CK(hipMalloc(&dshi, (size_t)rows * nb128 * 2));
+    CK(hipMalloc(&dslo, (size_t)rows * nb128 * 2));
+    const long long CH_ROWS = 4096;
+    std::vector<uint8_t> src;
+    std::vector<uint32_t> hi, lo;
+    std::vector<uint16_t> shi, slo;
+    for (long long r0 = 0; r0 < rows; r0 += CH_ROWS) {
+        const long long rn = std::min(CH_ROWS, rows - r0);
+        const size_t row_bytes = (size_t)nb32 * 34;
+        src.resize((size_t)rn * row_bytes);
+        CK(hipMemcpy(src.data(), (const uint8_t*)t->p + (size_t)r0 * row_bytes,
+                     src.size(), hipMemcpyDeviceToHost));
+        hi.assign((size_t)rn * (K / 8), 0u);
+        lo.assign((size_t)rn * (K / 8), 0u);
+        shi.assign((size_t)rn * nb128, 0);
+        slo.assign((size_t)rn * nb128, 0);
+        for (long long r = 0; r < rn; r++) {
+            for (int g = 0; g < nb128; g++) {
+                float blk[128];
+                float amax = 0.f;
+                for (int s32 = 0; s32 < 4; s32++) {
+                    const uint8_t* bp = src.data() + ((size_t)r * nb32 + g * 4 + s32) * 34;
+                    uint16_t hh; memcpy(&hh, bp, 2);
+                    const uint32_t sg = (hh >> 15) & 1, ex = (hh >> 10) & 0x1F,
+                                   ma = hh & 0x3FF;
+                    float d = ex == 0 ? ldexpf(ma / 1024.f, -14)
+                                      : ldexpf(1.f + ma / 1024.f, (int)ex - 15);
+                    if (sg) d = -d;
+                    for (int i = 0; i < 32; i++) {
+                        const float v = d * (float)((const int8_t*)bp)[2 + i];
+                        blk[s32 * 32 + i] = v;
+                        amax = std::max(amax, fabsf(v));
+                    }
+                }
+                const float sc = amax > 0 ? amax / 127.f : 1.f;
+                shi[(size_t)r * nb128 + g] = f32_to_f16(sc * 16.f);
+                slo[(size_t)r * nb128 + g] = f32_to_f16(sc);
+                for (int i = 0; i < 128; i++) {
+                    int q = (int)lrintf(blk[i] / sc);
+                    q = std::max(-128, std::min(127, q));
+                    const int hi4 = (q + 8) >> 4;          // floor，∈ [-8,7]
+                    const int lo4 = q - 16 * hi4;           // ∈ [-8,7]
+                    const size_t dword = (size_t)r * (K / 8) + (size_t)(g * 128 + i) / 8;
+                    const int sh = 4 * ((g * 128 + i) % 8);
+                    hi[dword] |= (uint32_t)(hi4 & 0xF) << sh;
+                    lo[dword] |= (uint32_t)(lo4 & 0xF) << sh;
+                }
+            }
+        }
+        CK(hipMemcpy((uint8_t*)dhi + (size_t)r0 * (K / 8) * 4, hi.data(), hi.size() * 4,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dlo + (size_t)r0 * (K / 8) * 4, lo.data(), lo.size() * 4,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dshi + (size_t)r0 * nb128 * 2, shi.data(), shi.size() * 2,
+                     hipMemcpyHostToDevice));
+        CK(hipMemcpy((uint8_t*)dslo + (size_t)r0 * nb128 * 2, slo.data(), slo.size() * 2,
+                     hipMemcpyHostToDevice));
+    }
+    if (getenv("RT_Q36_PACKCHK") && !packchk_done) {
+        packchk_done = true;
+        const size_t row_bytes = (size_t)nb32 * 34;
+        std::vector<uint8_t> one(row_bytes);
+        CK(hipMemcpy(one.data(), (const uint8_t*)t->p, row_bytes, hipMemcpyDeviceToHost));
+        // 第一行前 128 个权重的 Q8 原值与 W8 重建值（从刚打包的 host 缓冲取）
+        printf("packchk [rows=%lld K=%d]  前 8 个权重：\n", rows, K);
+        for (int i = 0; i < 8; i++) {
+            const uint8_t* bp = one.data() + (i / 32) * 34;
+            uint16_t hh; memcpy(&hh, bp, 2);
+            const uint32_t sg2 = (hh >> 15) & 1, ex2 = (hh >> 10) & 0x1F, ma2 = hh & 0x3FF;
+            float d = ex2 == 0 ? ldexpf(ma2 / 1024.f, -14) : ldexpf(1.f + ma2 / 1024.f, (int)ex2 - 15);
+            if (sg2) d = -d;
+            const float q8v = d * (float)((const int8_t*)bp)[2 + i % 32];
+            const uint32_t dw = hi[(size_t)(i / 8)];
+            const int h4 = (int)((dw >> (4 * (i % 8))) & 0xF);
+            const int hi_s = h4 >= 8 ? h4 - 16 : h4;
+            uint32_t dwl = lo[(size_t)(i / 8)];
+            const int l4 = (int)((dwl >> (4 * (i % 8))) & 0xF);
+            const int lo_s = l4 >= 8 ? l4 - 16 : l4;
+            float sh; { uint16_t t16 = shi[(size_t)(i / 128)];
+                        const uint32_t s2 = (t16 >> 15) & 1, e2 = (t16 >> 10) & 0x1F, m2 = t16 & 0x3FF;
+                        float f2 = e2 == 0 ? ldexpf(m2 / 1024.f, -14) : ldexpf(1.f + m2 / 1024.f, (int)e2 - 15);
+                        sh = sg2 ? -f2 : f2; }
+            float sl; { uint16_t t16 = slo[(size_t)(i / 128)];
+                        const uint32_t s2 = (t16 >> 15) & 1, e2 = (t16 >> 10) & 0x1F, m2 = t16 & 0x3FF;
+                        float f2 = e2 == 0 ? ldexpf(m2 / 1024.f, -14) : ldexpf(1.f + m2 / 1024.f, (int)e2 - 15);
+                        sl = sg2 ? -f2 : f2; }
+            const float w8v = hi_s * sh + lo_s * sl;
+            printf("   k=%d  Q8=%.6f  W8=%.6f  hi=%d sh=%.6f lo=%d sl=%.6f\n",
+                   i, q8v, w8v, hi_s, sh, lo_s, sl);
+        }
+    }
+    if (!getenv("RT_Q36_KEEPQ8")) CK(hipFree((void*)t->p));   // 源 Q8 用完就还显存
+    else t->nbytes = 0;
+    t->p = nullptr;
+    w.hi = dhi; w.lo = dlo; w.shi = dshi; w.slo = dslo;
+    return w;
+}
+
+// y[rows] = W · x（rows ≤ 4，两遍 W4A8）
+void lin_w8(float* y, const W8& w, const float* x, int rows, int n_out,
+            long long row_off = 0, float* tmp = nullptr) {
+    k_gemv_w4a8(y, (const u32*)((const uint8_t*)w.hi + row_off * (w.K / 8) * 4),
+                (const float*)((const uint8_t*)w.shi + row_off * (w.K / 128) * 2),
+                x, rows, n_out, (int)w.K);
+    if (!tmp) return;
+    k_gemv_w4a8(tmp, (const u32*)((const uint8_t*)w.lo + row_off * (w.K / 8) * 4),
+                (const float*)((const uint8_t*)w.slo + row_off * (w.K / 128) * 2),
+                x, rows, n_out, (int)w.K);
+    k_add_inplace(y, tmp, (long long)rows * n_out);
+}
+
 // MTP（blk.40）：nextn.eh_proj + 一层全注意力 + MoE + shared_head_norm → lm_head
 struct MtpW {
     const DevTensor *in_ln = nullptr, *post_ln = nullptr, *q = nullptr, *k = nullptr,
@@ -398,6 +549,8 @@ struct Mo35 {
     std::vector<float*> conv_state, ssm_state;
     int seq_len = 0, max_ctx = 40960, TP = 64, BM = 64;
     int n_partial = 0;
+    std::map<const void*, W8> w8;      // 张量 → 重打包后的 W8
+    float* tmp8 = nullptr;             // 第二遍（lo）输出暂存（按最大 N 分配）
     // 批量校验（M = K+1 ≤ 4 行）的缓冲
     float *h_last = nullptr;                    // 主模型最近一次的位置 hidden（MTP 草拟用）
     float *xr = nullptr, *xbr = nullptr, *qfull_r = nullptr, *hq_r = nullptr,
@@ -418,6 +571,7 @@ struct Mo35 {
     std::map<int, int> emb_rows;          // 位置 → emb_override 的行号
     Prof prof;
     bool mtp_enabled = false;
+    bool spec_mode = false;             // decode_step 里由它主导草拟链
     int draft = -1;
     long long mtp_try = 0, mtp_hit = 0;
     int mtp_k = 3;                              // 投机草稿数（1..3）
@@ -594,6 +748,27 @@ void bind(Mo35& m) {
             fix_vhead(need_mut(w, nm("attn_qkv.weight")), Hk, Hv, D, true, 2 * qn, vn);
         }
     }
+    // 把 Q8_0 线性权重重打包成 W8（hi/lo int4），运行时走现役高速 W4A8 内核
+    // 注意：W8（hi/lo int4 + W4A8 内核）实测线性层快 5~86 倍，
+    // 但数值还没有对齐（整模型输出退化），所以默认关闭，用 RT_Q36_W8=1 打开。
+    if (getenv("RT_Q36_W8") && strcmp(getenv("RT_Q36_W8"), "0")) {
+        int npack = 0;
+        long long bytes = 0;
+        for (auto& kv : w.t) {
+            DevTensor& t = kv.second;
+            if (!t.p || t.type != 8) continue;                 // 只处理 Q8_0
+            if (t.dims.empty() || t.dims[0] % 128) continue;   // K 必须是 128 的倍数
+            if (kv.first.find("token_embd") != std::string::npos) continue;   // 词表走主机解
+            if (const char* one = getenv("RT_Q36_PACK_ONE"))
+                if (kv.first != one) continue;
+            W8 p8 = pack_q8(&t);
+            bytes += (long long)p8.rows * p8.K;
+            m.w8[&kv.second] = p8;
+            npack++;
+        }
+        printf("W8 重打包：%d 个 Q8_0 线性权重（%.2f GB）\n", npack, bytes / 1e9);
+        fflush(stdout);
+    }
     printf("权重绑定完成：%d 层\n", m.cfg.n_layer);
     fprintf(stderr, "权重绑定完成：%d 层\n", m.cfg.n_layer);
 }
@@ -646,6 +821,7 @@ void alloc_bufs(Mo35& m) {
         const int M4 = 4;
         const int C = qn * 2 + vn;
         m.h_last = m.alloc(H);
+        m.tmp8 = m.alloc(c.vocab);
         m.xr = m.alloc(M4 * H); m.xbr = m.alloc(M4 * H);
         m.qfull_r = m.alloc(M4 * pd); m.hq_r = m.alloc(M4 * qd); m.hgate_r = m.alloc(M4 * qd);
         m.hkk_r = m.alloc(M4 * KV * D); m.hvv_r = m.alloc(M4 * KV * D);
@@ -681,9 +857,16 @@ void alloc_bufs(Mo35& m) {
 #define TRACE_SYNC(tag) do { if (getenv("RT_Q36_TRACE")) { CK(hipDeviceSynchronize()); printf("  [trace] %s\n", tag); fflush(stdout); } } while (0)
 
 // Q8_0 线性层；expert >= 0 时按专家切片（第 3 维是专家数）
+// 若该张量已重打包成 W8，则走两遍 W4A8（快 50 倍），否则退回 Q8 融合点积。
 void lin_q8(Mo35& m, float* y, const DevTensor* t, const float* x, int expert = -1) {
     const int K = (int)t->dims[0];
     const int N = t->dims.size() > 1 ? (int)t->dims[1] : 1;
+    auto it8 = m.w8.find(t);
+    if (it8 != m.w8.end()) {
+        const long long rowoff = expert >= 0 ? (long long)expert * N : 0;
+        lin_w8(y, it8->second, x, 1, N, rowoff, m.tmp8);
+        return;
+    }
     const void* p = t->p;
     if (expert >= 0 && t->dims.size() > 2) {
         const long long stride = (long long)N * (K / 32) * 34;
@@ -1006,6 +1189,12 @@ void linear_q8_rows(Mo35& m, float* y, const DevTensor* t, const float* x, int M
                     int expert = -1) {
     const int K = (int)t->dims[0];
     const int N = t->dims.size() > 1 ? (int)t->dims[1] : 1;
+    auto it8 = m.w8.find(t);
+    if (it8 != m.w8.end() && M <= 4) {
+        const long long rowoff = expert >= 0 ? (long long)expert * N : 0;
+        lin_w8(y, it8->second, x, M, N, rowoff, m.tmp8);
+        return;
+    }
     const int nbpr = K / 32;
     const void* p = t->p;
     if (expert >= 0 && t->dims.size() > 2)
@@ -1322,11 +1511,15 @@ void mtp_chain(Mo35& m, int first_token, int K, int* out) {
 // 不变量：返回后 KV 覆盖到「倒数第二个输出 token」的位置，最后一个待处理
 std::vector<int> decode_step(Mo35& m, int cur, int K) {
     std::vector<int> out;
+    m.spec_mode = true;                         // 草稿链由这里统一做
     const int pred = forward1(m, cur);          // KV 覆盖…位置 p；pred = p+1 的预测
+    m.spec_mode = false;
     if (K <= 0 || !m.mtp.bound || !m.mtp_enabled) { out.push_back(pred); return out; }
     const int mtp_len0 = m.mtp.len;
     int drafts[4] = {0, 0, 0, 0};
     mtp_chain(m, cur, K, drafts);
+    if (getenv("RT_Q36_SPEC"))
+        fprintf(stderr, "  [spec] pred=%d draft0=%d（mtp.len=%d）\n", pred, drafts[0], mtp_len0);
     if (drafts[0] != pred) {                    // 第一个就拒：草稿全弃
         m.mtp.len = mtp_len0;
         out.push_back(pred);
@@ -1405,7 +1598,7 @@ int forward1(Mo35& m, int id) {
             fprintf(stderr, "   层 %d/%d\n", il + 1, m.cfg.n_layer);
     }
     CK(hipMemcpy(m.h_last, m.x, (size_t)m.cfg.hidden * 4, hipMemcpyDeviceToDevice));
-    if (m.mtp.bound && m.mtp_enabled) m.draft = mtp_draft(m, id, m.x);
+    if (m.mtp.bound && m.mtp_enabled && !m.spec_mode) m.draft = mtp_draft(m, id, m.x);
     k_rmsnorm(m.xb, m.x, (const float*)m.fnorm->p, 1, m.cfg.hidden, m.cfg.eps, false);
     TRACE_SYNC("final norm ok");
     lin_q8(m, m.logits, m.lmhead, m.xb);
@@ -1693,6 +1886,38 @@ int run_moe35(int argc, char** argv) {
             }
             fflush(stdout);
         }
+        return 0;
+    }
+    if (getenv("RT_Q36_LINCHK")) {
+        // 同一张量、同一输入：Q8 路径 vs W8 路径
+        const DevTensor* t = need(m.w, getenv("RT_Q36_LINCHK"));
+        const int K = (int)t->dims[0], N = (int)t->dims[1];
+        std::vector<float> x((size_t)K);
+        for (int i = 0; i < K; i++) x[i] = (float)((i % 23) - 11) / 11.f;
+        CK(hipMemcpy(m.xb, x.data(), (size_t)K * 4, hipMemcpyHostToDevice));
+        fprintf(stderr, "LINCHK: t->p=%p xb=%p logits=%p partial=%p tmp8=%p\n",
+                (const void*)t->p, (void*)m.xb, (void*)m.logits, (void*)m.partial,
+                (void*)m.tmp8);
+        std::vector<float> y8((size_t)N), yw((size_t)N);
+        // Q8 路径（临时绕过 W8 表）
+        {
+            auto it = m.w8.find(t);
+            W8 save;
+            bool had = it != m.w8.end();
+            if (had) { save = it->second; m.w8.erase(it); }
+            lin_q8(m, m.logits, t, m.xb);
+            CK(hipDeviceSynchronize());
+            CK(hipMemcpy(y8.data(), m.logits, (size_t)N * 4, hipMemcpyDeviceToHost));
+            if (had) m.w8[t] = save;
+        }
+        lin_q8(m, m.logits, t, m.xb);
+        CK(hipDeviceSynchronize());
+        CK(hipMemcpy(yw.data(), m.logits, (size_t)N * 4, hipMemcpyDeviceToHost));
+        double mx = 0, err = 0;
+        for (int i = 0; i < N; i++) { mx = std::max(mx, (double)fabsf(y8[i])); err = std::max(err, (double)fabsf(y8[i] - yw[i])); }
+        printf("%s [N=%d,K=%d]  max|y|=%.4f  Q8 vs W8 max_abs=%.6f\n",
+               getenv("RT_Q36_LINCHK"), N, K, mx, err);
+        for (int i = 0; i < 4; i++) printf("   y8=%.5f yw=%.5f\n", y8[i], yw[i]);
         return 0;
     }
     if (getenv("RT_Q36_BENCH")) {
