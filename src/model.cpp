@@ -13,6 +13,7 @@
 //   rt --model ... --ids ... --dump out.bin --dump-layers 0,3 # 导出中间激活做对照
 #include "kernels.h"
 #include "vision_kernels.h"
+#include "moe35.h"
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -4004,6 +4005,9 @@ static bool rp4_has_part(const Rp4& r, const char* part) {
 }
 
 int main(int argc, char** argv) {
+    // qwen35moe（Qwen3.6-35B-A3B）走独立实现：rt --gguf <model.gguf> ...
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--gguf")) return run_moe35(argc, argv);
     std::string model, json, dump, mtp_path, mtp_json, vision_path, vision_json;
     std::vector<int> ids;
     bool stats_flag = false;

@@ -41,7 +41,7 @@ HID = {
 
 # 需要改写的文件：RT4 的运行时源码（.hip 里既有设备函数也有 host 包装）
 SOURCES = ["k_new.hip", "k_fa.hip", "k_gemv.hip", "k_gemm.hip", "k_vision.hip",
-           "k_nvfp4.hip", "model.cpp", "prefetch.h"]
+           "k_nvfp4.hip", "model.cpp", "moe35.cpp", "gguf.cpp", "prefetch.h"]
 
 # 设备头文件：里面既有常量/macro（host 侧也要用），也有设备函数。剥掉设备部分，
 # 保留常量，输出到 build/nodtk/kernels/，include 路径同时改写过去。
