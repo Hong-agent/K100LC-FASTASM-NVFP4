@@ -14,7 +14,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export RT_MODEL_DIR="$HERE/models/Qwen3.6-35B-A3B"
 export RT_RT4="$HERE/models/Qwen3.6-35B-A3B-q8/Qwen3.6-35B-A3B-Q8_0.gguf"
 export RT_RT4_JSON="$RT_RT4.json"                     # 引擎不读，仅满足入口检查
-export RT_SERVE_TAG="-q36"                            # 独立 pid/log，可与 27B 服务并存
+export RT_SERVE_TAG="-q36"
+export RT_VISION_DEVICE="${RT_VISION_DEVICE:-gpu}"
+export RT_VISION_RT4="$HERE/models/Qwen3.6-35B-A3B/qwen36_vision.rt4"
+export RT_VISION_OUT_H="${RT_VISION_OUT_H:-2048}"     # Qwen3.6 的视觉投影维度                            # 独立 pid/log，可与 27B 服务并存
 source "$HERE/scripts/env.sh"
 
 export RT_NVFP4=0 RT_RP4=0 RT_INT4_NATIVE=0

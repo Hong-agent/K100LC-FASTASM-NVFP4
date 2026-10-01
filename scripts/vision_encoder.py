@@ -63,7 +63,7 @@ class LocalVisionEncoder:
         self.last_ms = 0.0
 
     def encode(self, image_url):
-        """返回 (embeds f32 [N,5120], grid_thw list)。"""
+        """返回 (embeds f32 [N,D], grid_thw list)；D 由权重决定（27B=5120，Qwen3.6=2048）。"""
         if not image_url:
             raise ValueError('空图片')
         if self.device != 'cpu' and self.engine is None:
@@ -89,7 +89,7 @@ class LocalVisionEncoder:
                     out_path = os.path.join(td, 'emb.f32')
                     patches.tofile(patch_path)
                     n, ms = self.engine.image_embed(patch_path, out_path, gh, gw)
-                    embeds = np.fromfile(out_path, dtype='<f4').reshape(n, 5120)
+                    embeds = np.fromfile(out_path, dtype='<f4').reshape(n, -1)
                     self.last_ms = ms
         if not np.isfinite(embeds).all():
             raise RuntimeError('视觉塔输出含 NaN/Inf')

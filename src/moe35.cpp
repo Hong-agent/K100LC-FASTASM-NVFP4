@@ -9,6 +9,8 @@
 
 #include "gguf.h"
 #include "kernels.h"
+#include "vision_kernels.h"
+#include "vision.h"
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -328,6 +330,19 @@ void q8_selftest(Gguf& g, long long file_size) {
 // ================================ 模型 =====================================
 // 布局约定（与 GGUF 的 ne0 连续一致，也就与内核的 w[n*K + k] 一致）：
 //   Q8_0 专家张量 [K, N, E]：第 e 个专家基址 = p + e*(N*K/32*34)
+// MTP（blk.40）：nextn.eh_proj + 一层全注意力 + MoE + shared_head_norm → lm_head
+struct MtpW {
+    const DevTensor *in_ln = nullptr, *post_ln = nullptr, *q = nullptr, *k = nullptr,
+                    *v = nullptr, *o = nullptr, *qnorm = nullptr, *knorm = nullptr;
+    const DevTensor *eh = nullptr, *enorm = nullptr, *hnorm = nullptr, *shnorm = nullptr;
+    const DevTensor *ginp = nullptr, *gshexp = nullptr, *gexp = nullptr, *uexp = nullptr,
+                    *dexp = nullptr, *sgate = nullptr, *sup = nullptr, *sdown = nullptr;
+    u32 *kc = nullptr; float *ksc = nullptr, *vsc = nullptr, *vstage = nullptr; u32 *vc = nullptr;
+    float *e = nullptr, *hn = nullptr, *cat = nullptr, *x = nullptr;
+    int len = 0;                       // MTP 自己的位置计数
+    bool bound = false;
+};
+
 struct Mo35 {
     Gguf g;
     Cfg35 cfg;
@@ -349,6 +364,7 @@ struct Mo35 {
     };
     std::vector<L> Ls;
     const DevTensor *embed = nullptr, *fnorm = nullptr, *lmhead = nullptr;
+    MtpW mtp;
 
     // 激活（单 token；预填充时按 token 循环）
     float *x = nullptr, *xb = nullptr, *qfull = nullptr, *hq = nullptr, *hgate = nullptr,
@@ -366,6 +382,13 @@ struct Mo35 {
     std::vector<float*> conv_state, ssm_state;
     int seq_len = 0, max_ctx = 40960, TP = 64, BM = 64;
     int n_partial = 0;
+    VisionModel vis;
+    bool vision_on = false;
+    std::vector<float> emb_override;      // 图片 embedding（[rows][H]）
+    std::map<int, int> emb_rows;          // 位置 → emb_override 的行号
+    bool mtp_enabled = false;
+    int draft = -1;
+    long long mtp_try = 0, mtp_hit = 0;
 
     float* alloc(int n) {
         float* p = nullptr;
@@ -612,8 +635,8 @@ void lin_f32(Mo35& m, float* y, const DevTensor* t, const float* x) {
     linear_f32(y, (const float*)t->p, x, N, K);
 }
 
-// 词表行：主机侧解 Q8_0 → x（token_embd [K=2048, V]）
-void embed_row(Mo35& m, int id) {
+// 词表行：主机侧解 Q8_0 → dst（token_embd [K=2048, V]）
+void embed_row_into(Mo35& m, int id, float* dst) {
     STEP("embed");
     const DevTensor* t = m.embed;
     const int K = (int)t->dims[0];
@@ -631,24 +654,26 @@ void embed_row(Mo35& m, int id) {
         for (int i = 0; i < 32; i++)
             out[b * 32 + i] = d * (float)((const int8_t*)blk)[2 + i];
     }
-    CK(hipMemcpy(m.x, out.data(), (size_t)K * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(dst, out.data(), (size_t)K * 4, hipMemcpyHostToDevice));
 }
 
+void embed_row(Mo35& m, int id) { embed_row_into(m, id, m.x); }
+
 // MoE：路由 softmax + top-k → 逐专家 gate/up/down → 加权合并；再加共享专家（sigmoid 门）
-void moe(Mo35& m, int il) {
+// MoE 主体：可传任意层的权重视图（主干层 / MTP 层共用）
+void moe_apply(Mo35& m, const Mo35::L& L, float* x, int il) {
     STEP("moe: rmsnorm");
     const Cfg35& c = m.cfg;
-    Mo35::L& L = m.Ls[il];
     const int H = c.hidden, MI = c.moe_inter, E = c.n_expert, TOP = c.top_k;
     const bool dump = il == 0 && m.seq_len == 0 && getenv("RT_Q36_DUMP");
     if (dump) {
         std::vector<float> h((size_t)H);
-        CK(hipMemcpy(h.data(), m.x, (size_t)H * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(h.data(), x, (size_t)H * 4, hipMemcpyDeviceToHost));
         std::string p = std::string(getenv("RT_Q36_DUMP")) + ".moe_in.f32";
         FILE* fp = fopen(p.c_str(), "wb");
         if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
     }
-    k_rmsnorm(m.xb, m.x, (const float*)L.post_ln->p, 1, H, c.eps, false);
+    k_rmsnorm(m.xb, x, (const float*)L.post_ln->p, 1, H, c.eps, false);
 
     // 路由（f32 [H,E]）→ 主机 top-k + 重归一
     lin_f32(m, m.router, L.ginp, m.xb);
@@ -703,15 +728,82 @@ void moe(Mo35& m, int il) {
         k_add_inplace(m.acc, m.dbuf, H);
         TRACE_SYNC("exp acc ok");
     }
-    k_add_inplace(m.x, m.acc, H);
+    k_add_inplace(x, m.acc, H);
     if (dump) {
         std::vector<float> h((size_t)H);
-        CK(hipMemcpy(h.data(), m.x, (size_t)H * 4, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(h.data(), x, (size_t)H * 4, hipMemcpyDeviceToHost));
         std::string p = std::string(getenv("RT_Q36_DUMP")) + ".moe_out.f32";
         FILE* fp = fopen(p.c_str(), "wb");
         if (fp) { fwrite(h.data(), 4, h.size(), fp); fclose(fp); }
     }
     TRACE_SYNC("moe final add ok");
+}
+
+void moe(Mo35& m, int il) { moe_apply(m, m.Ls[il], m.x, il); }
+
+// BF16 → f32 设备副本（blk.40 的路由矩阵是 BF16）
+const DevTensor* bf16_to_f32_dev(Weights35& w, const std::string& name) {
+    const DevTensor* t = need(w, name);
+    const int n = (int)t->nelem();
+    std::vector<uint16_t> raw((size_t)n);
+    CK(hipMemcpy(raw.data(), t->p, (size_t)n * 2, hipMemcpyDeviceToHost));
+    std::vector<float> out((size_t)n);
+    for (int i = 0; i < n; i++) {
+        const uint32_t u = (uint32_t)raw[i] << 16;
+        memcpy(&out[i], &u, 4);
+    }
+    float* d = nullptr;
+    CK(hipMalloc(&d, (size_t)n * 4));
+    CK(hipMemcpy(d, out.data(), (size_t)n * 4, hipMemcpyHostToDevice));
+    DevTensor nd;
+    nd.p = d; nd.type = 0; nd.nbytes = (long long)n * 4; nd.dims = t->dims;
+    w.t[name + ".f32"] = nd;
+    return &w.t[name + ".f32"];
+}
+
+// MTP 头（blk.40）
+void bind_mtp(Mo35& m) {
+    Weights35& w = m.w;
+    MtpW& t = m.mtp;
+    if (!w.find("blk.40.attn_norm.weight")) {
+        printf("没有 blk.40（MTP 头），跳过\n");
+        return;
+    }
+    char b[256];
+    auto nm = [&](const char* s) { snprintf(b, sizeof(b), "blk.40.%s", s); return std::string(b); };
+    t.in_ln = need(w, nm("attn_norm.weight"));
+    t.post_ln = need(w, nm("post_attention_norm.weight"));
+    t.q = need(w, nm("attn_q.weight"));
+    t.k = need(w, nm("attn_k.weight"));
+    t.v = need(w, nm("attn_v.weight"));
+    t.o = need(w, nm("attn_output.weight"));
+    t.qnorm = need(w, nm("attn_q_norm.weight"));
+    t.knorm = need(w, nm("attn_k_norm.weight"));
+    t.eh = need(w, nm("nextn.eh_proj.weight"));
+    t.enorm = need(w, nm("nextn.enorm.weight"));
+    t.hnorm = need(w, nm("nextn.hnorm.weight"));
+    t.shnorm = need(w, nm("nextn.shared_head_norm.weight"));
+    t.ginp = bf16_to_f32_dev(w, nm("ffn_gate_inp.weight"));
+    t.gshexp = bf16_to_f32_dev(w, nm("ffn_gate_inp_shexp.weight"));
+    t.gexp = need(w, nm("ffn_gate_exps.weight"));
+    t.uexp = need(w, nm("ffn_up_exps.weight"));
+    t.dexp = need(w, nm("ffn_down_exps.weight"));
+    t.sgate = need(w, nm("ffn_gate_shexp.weight"));
+    t.sup = need(w, nm("ffn_up_shexp.weight"));
+    t.sdown = need(w, nm("ffn_down_shexp.weight"));
+    const Cfg35& c = m.cfg;
+    const int KV = c.n_kv, D = c.head_dim;
+    t.kc = m.alloc_u32(KV * m.max_ctx * (D / KVEL));
+    t.ksc = m.alloc(KV * 2 * m.max_ctx);
+    t.vc = m.alloc_u32(KV * (m.max_ctx / KVEL) * D);
+    t.vsc = m.alloc(KV * (m.max_ctx / 64) * D);
+    t.vstage = m.alloc(KV * 64 * D);
+    t.e = m.alloc(c.hidden);
+    t.hn = m.alloc(c.hidden);
+    t.cat = m.alloc(2 * c.hidden);
+    t.x = m.alloc(c.hidden);
+    t.bound = true;
+    printf("MTP 头就绪（blk.40）\n");
 }
 
 // 全注意力层（每 4 层一个）：q 带 gate、q/k 各自 RMSNorm、部分 RoPE、int8 KV + FA
@@ -831,9 +923,67 @@ void attn_lin(Mo35& m, int il) {
     k_add_inplace(m.x, m.tmp, Hd);
 }
 
+// MTP 草稿：输入「刚生成的 token + 主模型该位置的 hidden」，输出下一个 token 的草稿
+int mtp_draft(Mo35& m, int last_id, const float* hidden) {
+    MtpW& t = m.mtp;
+    if (!t.bound) return -1;
+    const Cfg35& c = m.cfg;
+    const int H = c.hidden, Hn = c.n_head, KV = c.n_kv, D = c.head_dim;
+    const int qd = Hn * D, pd = qd * 2;
+    embed_row_into(m, last_id, t.e);
+    k_rmsnorm(t.e, t.e, (const float*)t.enorm->p, 1, H, c.eps, false);
+    k_rmsnorm(t.hn, hidden, (const float*)t.hnorm->p, 1, H, c.eps, false);
+    k_concat2(t.cat, t.e, t.hn, 1, H);
+    lin_q8(m, t.x, t.eh, t.cat);
+    // 一层全注意力（用 MTP 自己的 KV）
+    k_rmsnorm(m.xb, t.x, (const float*)t.in_ln->p, 1, H, c.eps, false);
+    lin_q8(m, m.qfull, t.q, m.xb);
+    lin_q8(m, m.hkk, t.k, m.xb);
+    lin_q8(m, m.hvv, t.v, m.xb);
+    k_gather_heads(m.hq, m.qfull, 1, Hn, D, pd, 0, 2 * D);
+    k_gather_heads(m.hgate, m.qfull, 1, Hn, D, pd, D, 2 * D);
+    k_rmsnorm(m.hq, m.hq, (const float*)t.qnorm->p, Hn, D, c.eps, false);
+    k_rmsnorm(m.hkk, m.hkk, (const float*)t.knorm->p, KV, D, c.eps, false);
+    k_rope(m.hq, m.hkk, nullptr, t.len, 1, 1, Hn, KV, D, c.rot, c.rope_theta);
+    k_scale(m.hq, 1.f / sqrtf((float)D), (long long)qd);
+    k_attn_q_quant(m.qq, m.qs, m.hq, 1, Hn, D, 128, m.TP);
+    k_kv_append_k(t.kc, t.ksc, m.hkk, t.len, 1, KV, D, 128, m.max_ctx);
+    k_kv_append_v(t.vc, t.vsc, t.vstage, m.hvv, t.len, 1, KV, D, 64, m.max_ctx);
+    const int n_kv = t.len + 1;
+    k_attention(m.hfa, m.qq, m.qs, t.kc, t.ksc, t.vc, t.vsc, m.TP, 1, n_kv, t.len,
+                (n_kv + 63) / 64, Hn, Hn / KV, m.max_ctx, m.pout, m.pmax, m.psum, 8);
+    k_scatter_heads(m.hout, m.hfa, 1, Hn, D, qd, 0, m.TP);
+    k_sigmoid_mul(m.hout, m.hout, m.hgate, qd);
+    lin_q8(m, m.tmp, t.o, m.hout);
+    k_add_inplace(t.x, m.tmp, H);
+    // MoE（blk.40 的专家权重）
+    Mo35::L Lm;
+    Lm.post_ln = t.post_ln;
+    Lm.ginp = t.ginp; Lm.gshexp = t.gshexp; Lm.gexp = t.gexp; Lm.uexp = t.uexp;
+    Lm.dexp = t.dexp; Lm.sgate = t.sgate; Lm.sup = t.sup; Lm.sdown = t.sdown;
+    moe_apply(m, Lm, t.x, -1);
+    k_rmsnorm(m.xb, t.x, (const float*)t.shnorm->p, 1, H, c.eps, false);
+    lin_q8(m, m.logits, m.lmhead, m.xb);
+    int* d_best = nullptr;
+    CK(hipMalloc(&d_best, 4));
+    k_argmax(m.logits, c.vocab, d_best);
+    CK(hipDeviceSynchronize());
+    int id = -1;
+    CK(hipMemcpy(&id, d_best, 4, hipMemcpyDeviceToHost));
+    CK(hipFree(d_best));
+    t.len++;
+    return id;
+}
+
 int forward1(Mo35& m, int id) {
     STEP("forward1: embed");
-    embed_row(m, id);
+    auto it = m.emb_rows.find(m.seq_len);
+    if (it != m.emb_rows.end()) {
+        CK(hipMemcpy(m.x, m.emb_override.data() + (size_t)it->second * m.cfg.hidden,
+                     (size_t)m.cfg.hidden * 4, hipMemcpyHostToDevice));
+    } else {
+        embed_row(m, id);
+    }
     const char* dump_all = getenv("RT_Q36_DUMP_ALL");
     auto dumpx = [&](const char* fmt, int il) {
         if (!dump_all || m.seq_len != 0) return;
@@ -874,6 +1024,7 @@ int forward1(Mo35& m, int id) {
         if ((il + 1) % 10 == 0 || il == m.cfg.n_layer - 1)
             fprintf(stderr, "   层 %d/%d\n", il + 1, m.cfg.n_layer);
     }
+    if (m.mtp.bound && m.mtp_enabled) m.draft = mtp_draft(m, id, m.x);
     k_rmsnorm(m.xb, m.x, (const float*)m.fnorm->p, 1, m.cfg.hidden, m.cfg.eps, false);
     TRACE_SYNC("final norm ok");
     lin_q8(m, m.logits, m.lmhead, m.xb);
@@ -897,6 +1048,7 @@ int forward1(Mo35& m, int id) {
         for (int i = 0; i < k; i++) fprintf(stderr, " %d(%.2f)", id[i], lg[id[i]]);
         fprintf(stderr, "\n");
     }
+    if (m.draft >= 0) { m.mtp_try++; if (m.draft == best) m.mtp_hit++; }
     m.seq_len++;
     return best;
 }
@@ -909,7 +1061,7 @@ int run_moe35(int argc, char** argv) {
     bool selftest = false;
     bool engine = false;
     int max_layers = getenv("RT_Q36_MAXLAYERS") ? atoi(getenv("RT_Q36_MAXLAYERS")) : -1;
-    int gen_n = 0;
+    int gen_n = 0, mtp_n = 0;
     std::vector<int> ids;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -923,6 +1075,7 @@ int run_moe35(int argc, char** argv) {
         else if (a == "--engine") engine = true;
         else if (a == "--max-layers" && i + 1 < argc) max_layers = atoi(argv[++i]);
         else if (a == "--gen" && i + 1 < argc) gen_n = atoi(argv[++i]);
+        else if (a == "--mtp" && i + 1 < argc) mtp_n = atoi(argv[++i]);
         else if (a == "--ids" && i + 1 < argc) {
             std::string s = argv[++i];
             for (size_t p = 0; p < s.size();) {
@@ -1020,6 +1173,20 @@ int run_moe35(int argc, char** argv) {
     }
     bind(m);
     alloc_bufs(m);
+    bind_mtp(m);
+    if (mtp_n > 0) m.mtp_enabled = m.mtp.bound;
+    {
+        const char* env = getenv("RT_VISION_RT4");
+        std::string vpath = env && *env ? env
+            : std::string("models/Qwen3.6-35B-A3B/qwen36_vision.rt4");
+        if (access(vpath.c_str(), R_OK) == 0) {
+            m.vis.init(vpath, vpath + ".json");
+            m.vision_on = true;
+            fprintf(stderr, "视觉塔就绪（%s，投影维度 %d）\n", vpath.c_str(), m.vis.out_dim);
+        } else {
+            fprintf(stderr, "没有视觉权重 %s，图片功能关闭\n", vpath.c_str());
+        }
+    }
     if (engine) {
         // 引擎协议（serve.py / chat.py 用）：PREFILL / GEN / MTP / RESET / QUIT
         printf("READY\n");
@@ -1053,9 +1220,14 @@ int run_moe35(int argc, char** argv) {
                     }
                 }
                 m.seq_len = 0; last = -1;
+                m.mtp.len = 0; m.mtp_try = m.mtp_hit = 0; m.draft = -1;
                 printf("OK reset\n");
             } else if (op == "MTP") {
-                printf("OK mtp 0 (MoE 路径暂未接 MTP)\n");
+                const int k = atoi(arg.c_str());
+                m.mtp_enabled = (k > 0 && m.mtp.bound);
+                m.mtp_try = m.mtp_hit = 0;
+                printf("OK mtp %d%s\n", m.mtp_enabled ? k : 0,
+                       m.mtp.bound ? "" : " (无 MTP 权重)");
             } else if (op == "PREFILL" || op == "PREFILL_NR") {
                 std::vector<int> ids2;
                 for (size_t p = 0; p < arg.size();) {
@@ -1081,8 +1253,73 @@ int run_moe35(int argc, char** argv) {
                     fflush(stdout);
                 }
                 printf("END length=%d\n", n);
-            } else if (op == "IMG_EMB" || op == "PREFILL_EMB") {
-                printf("ERR 视觉/embedding 覆盖尚未接入这条路径\n");
+                if (m.mtp_try)
+                    fprintf(stderr, "MTP 统计：草稿 %lld，命中 %lld（%.1f%%）\n",
+                            m.mtp_try, m.mtp_hit, 100.0 * m.mtp_hit / m.mtp_try);
+            } else if (op == "IMG_EMB") {
+                // IMG_EMB <patch_file> <out_file> <gh> <gw>
+                if (!m.vision_on) { printf("ERR vision not loaded\n"); fflush(stdout); continue; }
+                std::vector<std::string> f;
+                { size_t p = 0; while (p <= arg.size()) { size_t q = arg.find(' ', p);
+                    if (q == std::string::npos) q = arg.size();
+                    f.push_back(arg.substr(p, q - p)); p = q + 1; } }
+                if (f.size() < 4) { printf("ERR IMG_EMB 参数不足\n"); fflush(stdout); continue; }
+                const auto t0 = std::chrono::steady_clock::now();
+                int ntok = 0;
+                if (!m.vis.encode_file(f[0], f[1], ntok, atoi(f[2].c_str()), atoi(f[3].c_str()))) {
+                    printf("ERR 视觉编码失败\n");
+                } else {
+                    const double ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t0).count();
+                    printf("OK image %d %.1f ms\n", ntok, ms);
+                }
+            } else if (op == "PREFILL_EMB") {
+                // PREFILL_EMB <ids> <emb_file> <off:count,...>
+                const size_t p1 = arg.find(' ');
+                const size_t p2 = p1 == std::string::npos ? std::string::npos
+                                                          : arg.find(' ', p1 + 1);
+                if (p1 == std::string::npos || p2 == std::string::npos) {
+                    printf("ERR usage PREFILL_EMB <ids> <emb_file> <off:count,...>\n");
+                    fflush(stdout);
+                    continue;
+                }
+                std::vector<int> ids2;
+                for (size_t p = 0; p < p1;) {
+                    size_t q = arg.find(',', p);
+                    if (q == std::string::npos || q > p1) q = p1;
+                    ids2.push_back(atoi(arg.substr(p, q - p).c_str()));
+                    p = q + 1;
+                }
+                std::string embf = arg.substr(p1 + 1, p2 - p1 - 1);
+                std::string spans = arg.substr(p2 + 1);
+                m.emb_rows.clear();
+                {
+                    std::ifstream fi(embf, std::ios::binary | std::ios::ate);
+                    if (!fi) { printf("ERR 打不开 embedding 文件\n"); fflush(stdout); continue; }
+                    const size_t bytes = (size_t)fi.tellg();
+                    fi.seekg(0);
+                    m.emb_override.resize(bytes / 4);
+                    fi.read((char*)m.emb_override.data(), bytes);
+                }
+                int pos = 0;
+                for (size_t p = 0; p < spans.size();) {
+                    size_t q = spans.find(',', p);
+                    if (q == std::string::npos) q = spans.size();
+                    const std::string sp = spans.substr(p, q - p);
+                    const size_t c = sp.find(':');
+                    const int off = atoi(sp.c_str());
+                    const int cnt = c == std::string::npos ? 0 : atoi(sp.c_str() + c + 1);
+                    for (int i = 0; i < cnt; i++) m.emb_rows[pos++] = off + i;
+                    p = q + 1;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int id : ids2) last = forward1(m, id);
+                m.emb_rows.clear();
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                printf("OK prefill total=%zu computed=%zu reused=0 mode=emb ms=%.1f tps=%.1f\n",
+                       ids2.size(), ids2.size(), ms,
+                       ms > 0 ? ids2.size() * 1000.0 / ms : 0.0);
             } else if (op == "STOP") {
                 /* 忽略 */
             } else {
@@ -1111,5 +1348,8 @@ int run_moe35(int argc, char** argv) {
         fprintf(stderr, "  gen %d → %d（%.1fs）\n", i, last,
                 (double)((int64_t)time(nullptr) - t0));
     }
+    if (m.mtp_try)
+        fprintf(stderr, "MTP 统计：草稿 %lld，命中 %lld（%.1f%%）\n",
+                m.mtp_try, m.mtp_hit, 100.0 * m.mtp_hit / m.mtp_try);
     return 0;
 }

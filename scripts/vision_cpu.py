@@ -21,7 +21,7 @@ HEADS = 16
 HD = 72
 INTER = 4304
 MERGE_IN = 4608
-OUT_H = 5120
+OUT_H = int(os.environ.get('RT_VISION_OUT_H', '5120'))   # 27B=5120，Qwen3.6=2048
 PATCH_DIM = 3 * 2 * 16 * 16
 POS_N = 2304
 POS_SIDE = 48
