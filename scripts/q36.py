@@ -35,6 +35,8 @@ def main():
     ap.add_argument('--max-layers', type=int, default=-1)
     ap.add_argument('--spawn', action='store_true',
                     help='不管常驻引擎，每次新起进程（调试用）')
+    ap.add_argument('--api', default=os.environ.get('RT_Q36_API', 'http://127.0.0.1:8082'),
+                    help='已经在跑的 serve 地址（有就跑它，不再加载权重）')
     args = ap.parse_args()
 
     import tok
@@ -59,6 +61,9 @@ def main():
             alive = False
     if alive and not args.spawn:
         out_ids = ask_daemon(ids, args.gen)
+    elif not args.spawn and api_alive(args.api):
+        print('复用正在跑的 serve：%s' % args.api, file=sys.stderr)
+        out_ids = ask_api(args.api, args.prompt or '', ids, args.gen)
     else:
         cmd = [os.path.join(ROOT, 'build/rt'), '--gguf', args.gguf,
                '--ids', ','.join(str(i) for i in ids), '--gen', str(args.gen)]
@@ -74,6 +79,36 @@ def main():
         return 0
     print(tok.tok().decode(out_ids, skip_special_tokens=False))
     return 0
+
+
+def api_alive(base):
+    if not base:
+        return False
+    try:
+        import urllib.request
+        with urllib.request.urlopen(base.rstrip('/') + '/health', timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def ask_api(base, prompt, ids, gen, timeout=900.0):
+    """把请求发给已经跑着的 HTTP 服务（模型已在显存里，不再加载）。"""
+    import json
+    import urllib.request
+    import tok
+    text = tok.tok().decode(ids)
+    payload = {'model': os.environ.get('RT_SERVED_NAME', 'qwen36-35b-a3b-q8'),
+               'messages': [{'role': 'user', 'content': text}],
+               'max_tokens': max(gen, 1), 'temperature': 0}
+    req = urllib.request.Request(base.rstrip('/') + '/v1/chat/completions',
+                                 data=json.dumps(payload).encode(),
+                                 headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = json.loads(r.read().decode())
+    msg = out['choices'][0]['message']
+    text_out = (msg.get('content') or '') + (msg.get('reasoning_content') or msg.get('reasoning') or '')
+    return tok.tok().encode(text_out).ids
 
 
 def ask_daemon(ids, gen, timeout=600.0):
