@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <poll.h>
 #include <sys/stat.h>
 #include <map>
 #include <string>
@@ -1803,15 +1804,52 @@ int run_moe35(int argc, char** argv) {
                        ids2.size(), ids2.size(), ms,
                        ms > 0 ? ids2.size() * 1000.0 / ms : 0.0);
             } else if (op == "GEN") {
-                int n = atoi(arg.c_str());
+                // GEN <n> <temp> <top_p> <top_k> <seed> <stop_csv>
+                std::vector<std::string> gf;
+                { size_t p = 0; while (p <= arg.size()) { size_t q = arg.find(' ', p);
+                    if (q == std::string::npos) q = arg.size();
+                    gf.push_back(arg.substr(p, q - p)); p = q + 1; } }
+                int n = !gf.empty() ? atoi(gf[0].c_str()) : 1;
                 if (n <= 0) n = 1;
+                std::vector<int> stops;
+                if (gf.size() > 5 && !gf[5].empty())
+                    for (size_t p = 0; p < gf[5].size();) {
+                        size_t q = gf[5].find(',', p);
+                        if (q == std::string::npos) q = gf[5].size();
+                        stops.push_back(atoi(gf[5].substr(p, q - p).c_str()));
+                        p = q + 1;
+                    }
+                for (int e : {248044, 248046}) stops.push_back(e);   // <|endoftext|> / <|im_end|>
                 if (last < 0) { printf("ERR no logits\n"); fflush(stdout); continue; }
+                int made = 0;
+                bool stopped = false;
                 for (int i = 0; i < n; i++) {
                     last = forward1(m, last);
                     printf("TOK %d\n", last);
                     fflush(stdout);
+                    made++;
+                    if (std::find(stops.begin(), stops.end(), last) != stops.end()) {
+                        stopped = true;
+                        break;
+                    }
+                    // 非阻塞看一眼 stdin：客户端按了「停止」就中断本轮
+                    struct pollfd pfd{0, POLLIN, 0};
+                    if (::poll(&pfd, 1, 0) > 0) {
+                        std::string line2;
+                        if (std::getline(std::cin, line2)) {
+                            if (!line2.empty() && line2.rfind("STOP", 0) == 0) {
+                                stopped = true;
+                                break;
+                            }
+                            if (!line2.empty() && line2.rfind("QUIT", 0) == 0) {
+                                printf("END length=%d stopped\n", made);
+                                fflush(stdout);
+                                return 0;
+                            }
+                        }
+                    }
                 }
-                printf("END length=%d\n", n);
+                printf("END length=%d%s\n", made, stopped ? " stopped" : "");
                 if (m.mtp_try)
                     fprintf(stderr, "MTP 统计：草稿 %lld，命中 %lld（%.1f%%）\n",
                             m.mtp_try, m.mtp_hit, 100.0 * m.mtp_hit / m.mtp_try);

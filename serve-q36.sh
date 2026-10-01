@@ -23,5 +23,7 @@ source "$HERE/scripts/env.sh"
 export RT_NVFP4=0 RT_RP4=0 RT_INT4_NATIVE=0
 export RT_NO_MTP=1
 export RT_SERVED_NAME="${RT_SERVED_NAME:-qwen36-35b-a3b-q8}"
+# 默认生成上限（Q8 内核下单 token ~0.45s；40960 会让一次请求占住引擎几小时）
+export RT_DEFAULT_MAX_TOKENS="${RT_DEFAULT_MAX_TOKENS:-1024}"
 export PORT="${PORT:-80}"
 exec bash "$HERE/serve.sh" "$@"
