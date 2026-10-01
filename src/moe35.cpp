@@ -146,6 +146,41 @@ void k_reduce(const float* partial, float* y, int rows, int nbpr) {
     reduce_blocks_k<<<rows, 64>>>(partial, y, rows, nbpr);
 }
 
+// f32 权重 GEMV：y[N] = W[N][K] · x[K]（路由 gate / 小张量）
+void linear_f32(float* y, const float* w, const float* x, int N, int K) {
+    gemv_f32_k<<<N, 64>>>(w, x, y, (unsigned)N, (unsigned)(K / 4), 64u);
+}
+
+// F32 权重自检：blk.0.ffn_gate_inp [K=2048, N=256]（MoE 路由矩阵）
+void f32_selftest(Gguf& g, long long file_size) {
+    const GgufTensor* t = g.find("blk.0.ffn_gate_inp.weight");
+    if (!t || t->type != 0) { printf("ffn_gate_inp 不是 F32\n"); return; }
+    const int K = (int)t->dims[0], N = (int)t->dims[1];
+    if (g.file_off(*t) + t->nbytes > file_size) { printf("  还没下完\n"); return; }
+    printf("F32 自检：blk.0.ffn_gate_inp [N=%d,K=%d]\n", N, K);
+    const float* w = (const float*)(g.map + g.file_off(*t));
+    std::vector<float> x((size_t)K);
+    srand(7);
+    for (int i = 0; i < K; i++) x[i] = (float)((rand() % 2000) - 1000) / 1000.f;
+    float *d_w = nullptr, *d_x = nullptr, *d_y = nullptr;
+    CK(hipMalloc(&d_w, (size_t)t->nbytes));
+    CK(hipMemcpy(d_w, w, (size_t)t->nbytes, hipMemcpyHostToDevice));
+    CK(hipMalloc(&d_x, (size_t)K * 4));
+    CK(hipMemcpy(d_x, x.data(), (size_t)K * 4, hipMemcpyHostToDevice));
+    CK(hipMalloc(&d_y, (size_t)N * 4));
+    linear_f32(d_y, d_w, d_x, N, K);
+    CK(hipDeviceSynchronize());
+    std::vector<float> got((size_t)N);
+    CK(hipMemcpy(got.data(), d_y, (size_t)N * 4, hipMemcpyDeviceToHost));
+    double maxerr = 0;
+    for (int n = 0; n < N; n++) {
+        double acc = 0;
+        for (int k = 0; k < K; k++) acc += (double)w[(size_t)n * K + k] * x[k];
+        maxerr = std::max(maxerr, fabs(acc - got[n]));
+    }
+    printf("  最大绝对误差 %.3e → %s\n", maxerr, maxerr < 1e-2 ? "一致 ✓" : "不一致 ✗");
+}
+
 // Q8_0 权重视图（GGUF 里 ne0 = 连续维 = K，ne1 = N）
 struct Q8W { const void* p = nullptr; int N = 0, K = 0; };
 
@@ -244,7 +279,11 @@ int run_moe35(int argc, char** argv) {
         fstat(fileno(f), &st);
         fclose(f);
     }
-    if (selftest) { q8_selftest(g, (long long)st.st_size); return 0; }
+    if (selftest) {
+        q8_selftest(g, (long long)st.st_size);
+        f32_selftest(g, (long long)st.st_size);
+        return 0;
+    }
     if (load_only) {
         // 只校验张量是否齐全（不占显存）
         for (auto& t : g.tensors)
