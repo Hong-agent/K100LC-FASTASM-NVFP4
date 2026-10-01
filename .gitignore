@@ -43,3 +43,7 @@ workspaces/
 .vscode/
 .idea/
 .DS_Store
+
+# ---- Qwen3.6 适配：权重与下载产物（不入库） ----
+models/Qwen3.6-35B-A3B-q8/
+models/Qwen3.6-35B-A3B-NVFP4/
