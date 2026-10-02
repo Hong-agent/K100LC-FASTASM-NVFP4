@@ -193,3 +193,35 @@ W4A8 两遍 int4 + add），M 取 512（= 运行时预填充的 `CHUNK`）：
 **默认配置因此定为**：`RedHatAI/Qwen3.8-27B-INT4` → RT4 int4（W4A8），MTP 头用
 int8/W8A8；NVFP4 checkpoint 与 NVFP4 直跑保留为 opt-in
 （`RT_MODEL_DIR=models/Qwen3.8-27B-NVFP4`、`NVFP4_ALL=mlp|all`）。
+
+## 2026-10-02 · 同步 K100LC-kernels v1.9.11 的 23 颗新内核：只有 rmsnorm_fast_k 能挂上，且在本运行时**不划算**
+
+内核包升到 v1.9.11（142 颗），其中 23 颗是本项目以前没有的。全部同步进构建后
+（`bash build.sh` 汇出 143 颗的 679,984 B HSACO），逐颗找过现役调用点：
+
+* **能挂上的只有 `rmsnorm_fast_k`**（两条模型路径的 `k_rmsnorm` 都在用：
+  27B 的 64 层 × 2~4 个 norm + Qwen3.6-MoE 的 attn/MoE norm）。零中心权重
+  （Qwen3.5/3.8 的 `y = x̂*(1+w)`）在第一次用到时把 `(1+w)` 算进一张常驻设备
+  缓冲，之后每次调用都能直接走快速内核 —— 改写后逐元素对账最大差 9.5e-07
+  （`python3 tests/test_rmsnorm_fast.py`，覆盖 D=64…5120 与零中心/非零中心）。
+* 其余 22 颗接不上：`flash_dec_*`/`vt_scatter_*` 吃 f32 转置 KV，本项目 KV 是
+  int4/int8 打包；`rope_apply_k` 吃 cos/sin 表；`gemv_f32_*` 面向稠密 f32 GEMV，
+  本项目线性层走 W4A8（MoE 路由也已改 W8）；`softmax_vec_k`/`block_*`/`reduce_*`
+  在本项目里没有独立调用点（online softmax 在注意力内核内部）。
+
+**收益实测（K100_LC，单卡）**：
+
+| 测法 | `rmsnorm_k`（现役） | `rmsnorm_fast_k` |
+|---|---|---|
+| 微基准 rows=1 D=5120（冷） | **22.2 µs** | 25.3 µs（0.88×） |
+| 微基准 rows=1 D=2048（冷） | **12.6 µs** | 13.5 µs（0.93×） |
+| 微基准 rows=1 D=256（投递地板） | 7.28 µs | 7.26 µs |
+| 27B 端到端 `--raw --n 32 --temp 0`，3 次均值 | 1181.9 ms | 1178.6 ms（−0.3%，噪声内） |
+
+包里的 15.0 → 7.5 µs 是拿 **HIP 版** `rmsnorm_k` 比的；本项目里的 `rmsnorm_k`
+同样是自研汇编器产出的汇编，在这颗芯片上已经贴着投递地板，4 条一批的 load
+换不来好处，反倒多用了寄存器。端到端 3 次重复的 token 序列完全一致
+（md5 相同），但两者归约顺序不同、有 ~1e-6 的数值差，长 greedy 序列里可能改道。
+
+**因此默认不开**（`RT_FASTNORM=1` 才走新内核），与项目里其它「实测不划算 /
+未对拍通过」的开关一致（`RT_INT4_NATIVE=0`、`RT_Q36_GATHER=0` 等）。

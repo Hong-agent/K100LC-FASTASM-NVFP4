@@ -8,7 +8,7 @@
 #   K100LC-FASTASM-NVFP4/          整个项目：源码 + 内核 + 网页 + 工具 + 测试 + 文档
 #     driver/                      DCU 驱动安装包（**不限内核版**）+ hyhal 快照 + 系统配置
 #     runtime/python, runtime/py   自带 Python 3.10 + fastapi/uvicorn/tokenizers/...
-#     prebuilt/rt, *.hsaco         预编译引擎（119 个内核，目标机不编译也能跑）
+#     prebuilt/rt, *.hsaco         预编译引擎（143 个内核，目标机不编译也能跑）
 #     models/Qwen3.8-27B-INT4/     默认模型（全 W4A8）：
 #         rt4/qwen38_27b.rt4        13.91 GB 主模型 int4
 #         rt4/qwen38_27b_mtp.rt4     0.22 GB MTP int4

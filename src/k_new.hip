@@ -10,6 +10,7 @@
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
     printf("HIP ERR %s @%d: %s\n", #x, __LINE__, hipGetErrorString(e_)); exit(1);} } while (0)
@@ -89,7 +90,44 @@ __global__ void rmsnorm_k(float* y, const float* x, const float* w, int D, float
     for (int i = threadIdx.x; i < D; i += blockDim.x)
         yr[i] = xr[i] * inv * (zc ? (1.f + w[i]) : w[i]);
 }
+// 快速 RMSNorm 的开关：**默认关**（RT_FASTNORM=1 打开做对照）。
+// 本项目的 rmsnorm_k 也是自研汇编器产出的汇编、已经贴着投递地板，实测
+// rmsnorm_fast_k 并不更快（详见 README「新内核在本项目里能接到哪一步」），
+// 而两者有 1e-6 量级的归约顺序差异，所以不设为默认。
+static const bool g_fastnorm = [] {
+    const char* e = getenv("RT_FASTNORM");
+    return e && atoi(e) != 0;
+}();
+
+// 零中心权重的一次性准备：(1 + w) 算进一张常驻设备缓冲，按权重指针缓存。
+// 每个权重只在第一次用到时算一次（fill + add），之后每层每 token 都直接复用。
+static const float* zc_weight(const float* w, int D) {
+    static std::map<const float*, const float*> cache;
+    auto it = cache.find(w);
+    if (it != cache.end()) return it->second;
+    float* p = nullptr;
+    CK(hipMalloc(&p, (size_t)D * 4));
+    k_fill(p, 1.f, D);
+    k_add_inplace(p, w, D);                       // p = 1 + w
+    cache.emplace(w, p);
+    return p;
+}
+
 void k_rmsnorm(float* y, const float* x, const float* w, int rows, int D, float eps, bool zc) {
+    // 快速 RMSNorm（K100LC-kernels v1.9.10 的 rmsnorm_fast_k，源码见
+    // kernels/asm/k_pkg/rmsnorm_fast_k.s）：同一套算法，但把 load 按 4 个一批发
+    // （包里对照 HIP 版是 15.0 → 7.5 µs）。语义 = y = x̂ * w（非零中心），
+    // grid = rows、workgroup = 64、要求 D % 64 == 0。
+    //
+    // 引擎里零中心权重（y = x̂*(1+w)）居多，所以首次见到某个权重指针时把 (1+w)
+    // 预先算进一张常驻设备缓冲（每个权重只算一次），之后每次调用都能走快速内核。
+    // 本项目里它不比 rmsnorm_k 快（实测见 README），所以只由 RT_FASTNORM=1 打开；
+    // 维度不满足 D % 64 == 0 时自动退回旧内核。
+    if (g_fastnorm && rows > 0 && (D & 63) == 0) {
+        rmsnorm_fast_k<<<rows, 64>>>(y, x, zc ? zc_weight(w, D) : w, D, eps);
+        CK(hipGetLastError());
+        return;
+    }
     rmsnorm_k<<<rows, D >= 256 ? 256 : 64>>>(y, x, w, D, eps, zc ? 1 : 0); CK(hipGetLastError());
 }
 

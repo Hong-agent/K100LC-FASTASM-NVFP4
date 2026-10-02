@@ -35,6 +35,7 @@ run test_merge_hsacos     bash tests/test_merge_hsacos.sh
 run test_scale_mul        bash tests/test_scale_mul.sh
 run test_reloc_manifest   bash tests/test_reloc_manifest.sh
 run test_all_kernels      bash tests/test_all_kernels_hsaco.sh
+run test_rmsnorm_fast     python3 tests/test_rmsnorm_fast.py
 
 echo "== 服务层与基准脚本（不需要 DCU / 权重，用假引擎/假依赖）=="
 run test_engine_restart   python3 tests/test_engine_restart.py

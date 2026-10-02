@@ -28,9 +28,9 @@ RT4 int4 权重直跑**，同一个项目里跑完整 27B 模型，并自带网�
 
 ## 一句话
 
-> 119 个模型内核由自研汇编器从 `.s` 汇编出来，逐字节等于 K100LC-kernels 包内的
-> 预编译产物（81 个 FASTASM 基线 + 38 个自研）；
-> 打成一个 632,920 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
+> 143 个模型内核由自研汇编器从 `.s` 汇编出来，与 K100LC-kernels 包 v1.9.11 的
+> 142 个内核逐字节对齐（外加本项目的 `gather_exp_k`）；
+> 打成一个 679,984 字节的 HSACO；运行时只链接 `libhsa-runtime64`（DTK 库引用
 > **0**）。默认的 int4 主模型走 RT4 W4A8（int4 权重 × int8 激活），不做 NVFP4
 > 替换；打开 `NVFP4_ALL=mlp|all` 才有 NVFP4 直跑 —— MLP 的 168 个是 checkpoint
 > 原样（权重零误差），其余 233 个（注意力/线性注意力投影、lm_head、56~63 层 MLP）
@@ -126,8 +126,8 @@ I32 + `weight_scale` BF16），不经过 `tools/convert.c` 的重量化 —— �
 ```bash
 python3 /home/t/桌面/K100LC-kernels/tools/int4_engine_manifest.py \
         -o build/int4_manifest.tsv      # 400 层权重清单（文件偏移 + 字节数自检）
-python3 tools/sync_kernels.py           # 同步 K100LC-kernels 的全部内核（119 个）
-bash build.sh                           # 重新汇编（119 个内核）并编出 build/rt
+python3 tools/sync_kernels.py           # 同步 K100LC-kernels 的全部内核（142 个）
+bash build.sh                           # 重新汇编（143 个内核）并编出 build/rt
 RT_INT4_NATIVE=1 PORT=8080 bash serve.sh  # 网页 + /v1，日志里会出现「INT4 原生：400 个线性层…」
 ```
 
@@ -141,19 +141,27 @@ RT_INT4_NATIVE=1 PORT=8080 bash serve.sh  # 网页 + /v1，日志里会出现「
 换来的是权重零误差 + f32 激活（A16）。格式、ABI、逐层带宽与对账见
 `K100LC-kernels/docs/INT4.md`。
 
-### 内核支持：与 K100LC-kernels 包同步（119 个内核）
+### 内核支持：与 K100LC-kernels 包同步（143 个内核）
 
-项目的内核构建现在与可复用内核包 **K100LC-kernels v1.0.0 完全对齐**：
-`kernels/kernel_spec.json` + `kernels/asm/**` 共 **119 个内核**（81 个 FASTASM
-基线 + 38 个自研），`bash build.sh` 汇编出的 `build/k100lc_all.hsaco`
-（632,920 B）与包内 `prebuilt/k100lc_kernels.hsaco` **逐字节一致**。
+项目的内核构建与可复用内核包 **K100LC-kernels v1.9.11 对齐**：
+`kernels/kernel_spec.json` + `kernels/asm/**` 共 **143 个内核** —— 142 个与包内
+三份权威清单同名（`kernels/kernel_spec.json` 基线 85 个、`flashmoe.spec.json`
+34 个、`native_kernels.spec.json` 52 个，去重后 142 个），多出来的 `gather_exp_k`
+（专家权重 gather，见 `kernels/asm/k_moe/`）是本项目自己的。
+
+同名内核**默认不覆盖**项目里的副本（避免把项目自己的改动盖掉）。包内 v1.9.x
+把点积族（`q4k/q5k/q6k/iq*_dot_k`、`int4_dot_k`）和 `reduce_blocks_k` 改成了
+「一拍发 8/16 条 load、只等一次」，那批要显式 `--refresh` 才会换进来（实测在
+本项目的形状上只快 1~3%，而它们只走 `RT_INT4_NATIVE=1` / `RT_Q36_W8=0` 这两条
+非默认路径，所以本轮没有刷）。
 
 ```bash
 python3 tools/sync_kernels.py --check        # 只报告差多少
 python3 tools/sync_kernels.py                # 把缺的内核同步进来（默认不覆盖同名）
 python3 tools/sync_kernels.py --refresh      # 同名内核也用包里的版本覆盖
-bash build.sh                                # 重新汇编 119 个内核
+bash build.sh                                # 重新汇编 143 个内核
 bash tests/test_all_kernels_hsaco.sh         # 逐个解析全部内核符号并跑通
+python3 tests/test_rmsnorm_fast.py           # 新内核 rmsnorm_fast_k 的逐元素对账
 ```
 
 同步进来的自研内核按用途：
@@ -164,8 +172,44 @@ bash tests/test_all_kernels_hsaco.sh         # 逐个解析全部内核符号并
 | W4A4 / W4A8 GEMV | `gemv_w4a4_r2_k`、`gemv_w4a4_r2_m3_k`、`gemv_i8_k`、`gemv_f32_k`、`gemv_f32_warp_k` |
 | GGUF 原生解码/点积 | `q2_0/q4_0/q8_0/iq4nl/iq4xs/iq2s/iq3s/iq3xxs/q4k/q5k/q6k` 的 `*_dequant_k` / `*_dot_k` |
 | 通用算子 | `gelu_mul_k`、`softmax_k`、`layernorm_k`、`topk_k`、`router_top10_k`、`iq4nl_to_i8_k` |
+| **v1.9.x 新增（本轮同步）** | `rmsnorm_fast_k`、`vt_scatter_k` / `vt_scatter_v_k` / `vt_scatter_v1_k`、`flash_dec_part_k` / `flash_dec_comb_k`、`gemv_f32_rows8_k` / `_acc_k` / `_split_k`、`gemv_f32_warp_acc_k`、`gemv_f32_gated_acc_k`、`moe_combine_k` / `moe_combine_gather_k`、`gather_rows_k`、`softmax_vec_k`、`block_max_k` / `block_exp_sum_k`、`reduce_max1_k` / `reduce_sum1_k`、`div_scalar_k`、`rope_apply_k`、`embed_f16_k`、`attn_pv_part` |
 
-项目里已经在用的还是原来的 59 个；其余内核在 HSACO 里可用，需要时按
+### 新内核在**本项目**里能接到哪一步（实测）
+
+新内核是按内核包自己的模型层（f32 KV、cos/sin 表 RoPE、f32 GEMV、f16 词表）
+调的，而本项目主通路用的是自己的一套**打包布局**（KV 走 int4/int8 打包、
+W4A8 GEMV、融合多头解码注意力），所以能直接替换的点不多。逐条量过的结论：
+
+| 新内核 | 本项目里对应的位置 | 结论 |
+|---|---|---|
+| `rmsnorm_fast_k` | `k_rmsnorm`（src/k_new.hip，两条模型路径都在用） | **已接**，开关 `RT_FASTNORM`（默认 `0`）。见下面的实测 |
+| `gemv_f32_rows8_k` / `_acc_k` / `_split_k` / `gemv_f32_warp_acc_k` / `gemv_f32_gated_acc_k` | 稠密 f32 GEMV；本项目线性层走 W4A8，只有 MoE 路由曾是 f32，且已改成 W8 | 暂时挂不上（形状/精度都不合适） |
+| `flash_dec_part_k` / `flash_dec_comb_k` / `attn_pv_part` | `k_attention`（打包 KV + 融合多头解码） | 布局不同：包内是 f32 转置 K / 行主序 V，本项目 KV 是 int4/int8 打包 |
+| `softmax_vec_k`、`block_max_k`、`block_exp_sum_k`、`reduce_max1_k`、`reduce_sum1_k`、`div_scalar_k` | 本项目 softmax 在注意力内核内部（online softmax），没有独立 softmax 调用 | 无调用点 |
+| `moe_combine_k` / `moe_combine_gather_k`、`gather_rows_k` | Qwen3.6 MoE 的专家合并 / 分桶（见 src/moe35.cpp） | 可接但要重构；实测省的只是十几次投递（~0.1 ms/层），暂缓 |
+| `vt_scatter_*` | `k_kv_append_k` / `k_kv_append_v`（打包 KV 写入） | 布局不同 |
+| `rope_apply_k` | `k_rope` | 包内吃 cos/sin 表，本项目现算频率（不吃表） |
+| `embed_f16_k` | `k_embed`（int4 词表） | 权重格式不同 |
+
+#### `rmsnorm_fast_k` 实测（K100_LC，本机）
+
+包里的对照是「HIP 版 `rmsnorm_k` 15.0 µs → `rmsnorm_fast_k` 7.5 µs」；
+**在本项目的自研运行时里这个收益不成立**：
+
+| 测法 | 现役 `rmsnorm_k` | `rmsnorm_fast_k` |
+|---|---|---|
+| 单核微基准，rows=1 / D=5120（缓存冷） | **22.2 µs** | 25.3 µs |
+| 单核微基准，rows=1 / D=2048（缓存冷） | **12.6 µs** | 13.5 µs |
+| 单核微基准，rows=1 / D=256（等于投递地板） | 7.28 µs | 7.26 µs |
+| 27B 端到端（`--raw --n 32 --temp 0`，3 次均值） | 1181.9 ms | 1178.6 ms（−0.3%，在噪声内） |
+
+原因是本项目里的 `rmsnorm_k` 也是自研汇编器从同一份 HIP 源码产出的汇编
+（`kernels/asm/k_new/006__...s`），在这个运行时/这颗芯片上它已经贴着投递地板，
+`rmsnorm_fast_k` 把 4 条 load 一批发并没有换来好处。因为收益为 0 而数值上
+会有 1e-6 量级的重排差异（端到端 greedy 输出可能因此改道），**默认不开**，
+要做对照或等后续版本再量时用 `RT_FASTNORM=1`。
+
+引擎实际启动的仍只是其中 63 个；其余内核在 HSACO 里可用，需要时按
 `K100LC-kernels/docs/ABI.md` 的参数表启动即可。
 
 **结论：NVFP4 直跑是备用选项，不是推荐配置。** 理由是实测不划算（同一台 K100_LC、
@@ -234,8 +278,8 @@ RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 
 | 环节 | 结果 |
 |---|---|
-| 自研汇编器 | 119 个内核全部从 `.s` 汇编；与 K100LC-kernels 包内预编译 `.bin` **逐字节一致** |
-| 自研 HSACO | 单文件 **632,920 B**，含 119 个内核；HSA 解析全部符号并执行 |
+| 自研汇编器 | 143 个内核全部从 `.s` 汇编；其中 142 个与 K100LC-kernels 包内预编译 `.bin` **逐字节一致** |
+| 自研 HSACO | 单文件 **679,984 B**，含 143 个内核；HSA 解析全部符号并执行 |
 | 运行时依赖 | `build/rt` 只链接 **libhsa-runtime64.so.1**；DTK 库引用 **0** |
 | 默认模型 | `RedHatAI/Qwen3.8-27B-INT4` → RT4 int4（W4A8）；主模型 851 张量 = 402 int4 + 353 f32 + 96 f16 |
 | 模型加载（默认） | int4 路线的 `.rp4` 单文件 **14.351 GB**，874 张量（main 851 / MTP 23），视觉塔不装进去 |
@@ -253,7 +297,7 @@ RP4=/path/to/model-int4.rp4 bash scripts/setup_models.sh
 | 路径 | 内容 |
 |---|---|
 | `asm.py`、`encodings.json` | **自研表驱动汇编器**与指令编码表（424+ 个编码形式） |
-| `kernels/asm/` | 119 个内核的 `.s` 源码（基线 + 自研；`k_pkg/` 是从 K100LC-kernels 同步来的） |
+| `kernels/asm/` | 143 个内核的 `.s` 源码（基线 + 自研；`k_pkg/` 是从 K100LC-kernels 同步来的） |
 | `kernels/kernel_spec.json` | 每个内核的参数表、kernarg/段大小、SGPR/VGPR 计数 |
 | `kernels/kv_pack.h` 等 | 内核共用常量与 RT4 内核头 |
 | `kernels/nvfp4/`、`include/nvfp4/` | **NVFP4** 解码 GEMV / GEMM 内核与 FP4→int8 原语 |
