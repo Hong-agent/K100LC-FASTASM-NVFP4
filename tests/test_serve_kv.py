@@ -39,10 +39,16 @@ def post(path, body, timeout=600):
 
 
 def chat(messages, conv=CONV, mt=48):
+    content, tim, skills = chat_events(messages, conv, mt)
+    return content, tim
+
+
+def chat_events(messages, conv=CONV, mt=48):
+    """同上，但把技能事件也带出来（判断这一轮有没有真的调技能）。"""
     body = {'model': 'qwen38-fastasm-int4', 'messages': messages, 'max_tokens': mt,
             'temperature': 0, 'stream': True, 'skills': True, 'conversation_id': conv,
             'reasoning_effort': 'low'}
-    content, tim = '', None
+    content, tim, skills = '', None, []
     with post('/v1/chat/completions', body) as r:
         for raw in r:
             line = raw.decode('utf-8', 'replace').strip()
@@ -55,10 +61,18 @@ def chat(messages, conv=CONV, mt=48):
                 j = json.loads(d)
             except ValueError:
                 continue
+            if j.get('type') == 'skill':
+                ev = j.get('skill') or {}
+                skills.append((ev.get('name'), ev.get('ok')))
+            if j.get('type') == 'round_reset':
+                # 网页收到 round_reset 会清空气泡：这一轮其实是在调技能，
+                # 那段文字不算回答（见 web/index.html 的 round_reset 处理）。
+                skills.append(('round_reset', None))
+                content = ''
             content += ((j.get('choices') or [{}])[0].get('delta') or {}).get('content') or ''
             if j.get('timings'):
                 tim = j['timings']
-    return content, tim
+    return content, tim, skills
 
 
 def main() -> int:
@@ -112,6 +126,18 @@ def main() -> int:
         _, tim_new = chat([{'role': 'user', 'content': '你好，一句话回答。'}], conv='other')
         print(f'  新会话: 计算 {tim_new["prefill_tokens"]} tok，复用 {tim_new.get("prefill_reused", 0)} tok')
 
+        # 工具调用轮次：这一轮服务端内部会追加 assistant(工具调用)+tool 结果，
+        # 客户端下一轮不会把它们带回来。提交前缀的 key 必须只用「客户端视角」，
+        # 否则下一轮对不上 → 整段重算（修复前实测 1463 tok 全算）。
+        sk_msgs = [{'role': 'user', 'content': '用 calc 技能算一下 12345 乘 6789 等于多少。'}]
+        _ans, _t1, ev = chat_events(sk_msgs, conv='skill-kv')
+        sk_msgs.append({'role': 'assistant', 'content': _ans})
+        sk_msgs.append({'role': 'user', 'content': '那再加 1 呢？'})
+        _ans2, t_tool, ev2 = chat_events(sk_msgs, conv='skill-kv')
+        got_skill = bool(ev + ev2)          # 调了技能，或至少出现过一次技能调用轮
+        print(f'  技能轮: 事件={ev + ev2}，第 2 轮计算 {t_tool["prefill_tokens"]} tok，'
+              f'复用 {t_tool.get("prefill_reused", 0)} tok')
+
         bad = []
         if reused[1] <= 0 or reused[2] <= 0:
             bad.append('第 2/3 轮没有复用（应当完全命中）')
@@ -121,11 +147,15 @@ def main() -> int:
             bad.append('改写历史后仍在复用')
         if tim_new.get('prefill_reused', 0) != 0:
             bad.append('新会话仍在复用')
+        # 技能轮之后的那一轮也该完全命中（只剩新问题那几个 token 要算）
+        if got_skill and (t_tool.get('prefill_reused', 0) <= 0 or
+                          t_tool['prefill_tokens'] > 60):
+            bad.append(f'技能轮之后没有命中：计算 {t_tool["prefill_tokens"]} tok')
         if bad:
             for b in bad:
                 print('FAIL:', b)
             return 1
-        print('serve kv ok：第 2/3 轮完全命中，改历史/换会话正确回退')
+        print('serve kv ok：第 2/3 轮与技能轮之后都完全命中，改历史/换会话正确回退')
         return 0
     finally:
         srv.terminate()

@@ -196,8 +196,12 @@ def _conv_ids_reusable(conv, ids):
     return committed[:n] == ids[:n]
 
 
-def _conv_prefix_ids(conv, msgs, kw):
-    """历史能接在已提交序列后面就返回 (ids, rendered)，否则返回 None。"""
+def _conv_prefix_ids(conv, keys, rmsgs, kw):
+    """历史能接在已提交序列后面就返回 (ids, rendered)，否则返回 None。
+
+    keys 是**客户端视角**的消息键（用于和上一轮提交的对齐），rmsgs 是真正拿去
+    渲染的消息（可能比 keys 多一段服务端注入的说明，见 build_ids_and_embeds）。
+    """
     if not conv:
         return None
     with _CONV_KV_LOCK:
@@ -206,14 +210,13 @@ def _conv_prefix_ids(conv, msgs, kw):
     # 它的 KV 已随进程消失，前缀作废、整段重算。
     if not st or st.get('epoch') != (ENGINE.epoch if ENGINE else 0):
         return None
-    keys = [_conv_msg_key(m) for m in msgs]
     n = len(st['keys'])
     # 必须严格是「已提交的消息 + 新消息」：客户端改了历史（哪怕只是删了一条）
     # 就对不上，这时宁可整段重算，也不要拿旧序列顶替。
     if len(keys) <= n or keys[:n] != st['keys']:
         return None
-    head = T.apply_chat(msgs[:n], add_generation_prompt=False, **kw)
-    full = T.apply_chat(msgs, add_generation_prompt=True, **kw)
+    head = T.apply_chat(rmsgs[:n], add_generation_prompt=False, **kw)
+    full = T.apply_chat(rmsgs, add_generation_prompt=True, **kw)
     if not head.endswith('\n') or not full.startswith(head):
         return None
     # head 末尾的 '\n' 属于「消息之间的分隔」，要保留给新内容
@@ -221,12 +224,17 @@ def _conv_prefix_ids(conv, msgs, kw):
     return st['ids'] + T.encode(suffix), full
 
 
-def _conv_kv_commit(conv, msgs, ids, toks, answer):
+def _conv_kv_commit(conv, keys, ids, toks, answer):
     """把这一轮的结果记成「已提交前缀」。answer 是回给客户端、下一轮会被原样
-    带回来的那段助手正文（不含思考段）。"""
-    if not conv or not msgs or any(m.get('role') == 'tool' for m in msgs):
+    带回来的那段助手正文（不含思考段）。
+
+    keys 必须是**客户端视角**的消息键：工具调用轮次里 msgs 会被追加 assistant
+    工具调用与 tool 结果，那些是服务端内部拼的，客户端下轮不会带回来；拿它们
+    当 key 会让下一轮对不上 → 整段重算。ids 仍然记引擎真正看到的序列（含工具
+    轮次），因为那才是 KV 里实际存在的 token。"""
+    if not conv or not keys or any(k[0] == 'tool' for k in keys):
         return
-    keys = [_conv_msg_key(m) for m in msgs] + [('assistant', answer or '')]
+    keys = list(keys) + [('assistant', answer or '')]
     with _CONV_KV_LOCK:
         _CONV_KV[conv] = {'keys': keys, 'ids': list(ids) + list(toks),
                           'epoch': ENGINE.epoch if ENGINE else 0}
@@ -756,11 +764,15 @@ def prepare_messages(messages):
     return prepare_messages_and_embeds(messages)[0]
 
 
-def build_ids_and_embeds(body, conv=None):
+def build_ids_and_embeds(body, conv=None, note_text=''):
     """把 OpenAI 请求变成 token id 序列 + 本地视觉 embedding 列表。
 
     conv 非空且历史与上一轮完全一致时，走「拼接已提交 token 序列」的快路径，
     让引擎侧 KV 复用能完全命中（见 _conv_prefix_ids 的说明）。
+
+    note_text 是服务端临时注入的说明（工作区文件清单），只参与**渲染**、不参与
+    「已提交前缀」的 key：文件清单随手写一个文件就变，放进前缀会让整段 KV 失效。
+    它被追加到最后一条消息末尾，于是落在本轮新算的那一小段里。
 
     返回值第 5 项 noreuse：没能走快路径、且本次 ids 与这条会话已提交的 token 序列
     不是前缀相容（见 _conv_ids_reusable）时，显式要求引擎整段重算。引擎只认 token
@@ -774,6 +786,13 @@ def build_ids_and_embeds(body, conv=None):
     """
     if body.get('messages'):
         msgs, embeds = prepare_messages_and_embeds(body['messages'])
+        keys = [_conv_msg_key(m) for m in msgs]
+        rmsgs = msgs
+        if note_text:
+            rmsgs = [dict(m) for m in msgs]
+            if rmsgs:
+                rmsgs[-1]['content'] = \
+                    ((rmsgs[-1].get('content') or '') + '\n\n' + note_text).strip()
         # 模型自带的模板默认走 xhigh 推理强度（会先输出一段思考）；客户端可以用
         # {"reasoning_effort": "low"} 让它直接给结论。模板只认 xhigh/medium/low。
         kw = template_kwargs(body)
@@ -783,12 +802,12 @@ def build_ids_and_embeds(body, conv=None):
         # 工具段的渲染都依赖消息之外的信息，按文本前缀拼会把旧内容带进来。
         plain = not embeds and not any(m.get('role') == 'tool' for m in msgs)
         if plain:
-            hit = _conv_prefix_ids(conv, msgs, kw)
+            hit = _conv_prefix_ids(conv, keys, rmsgs, kw)
             if hit is not None:
-                return hit[0], hit[1], embeds, msgs, False
-        txt = T.apply_chat(msgs, add_generation_prompt=True, **kw)
+                return hit[0], hit[1], embeds, keys, False
+        txt = T.apply_chat(rmsgs, add_generation_prompt=True, **kw)
         ids = T.encode(txt)
-        return ids, txt, embeds, msgs, bool(conv) and not _conv_ids_reusable(conv, ids)
+        return ids, txt, embeds, keys, bool(conv) and not _conv_ids_reusable(conv, ids)
     prompt = body.get('prompt', '')
     if isinstance(prompt, list):
         prompt = prompt[0]
@@ -1314,7 +1333,7 @@ async def _complete(body: dict):
     n, temp, top_p, top_k, seed = sampling(body)
     conv = _conversation_id(body)
     # 文档/图片整理、视觉桥调用和 tokenizer 都不占 GPU；放线程里避免卡住事件循环。
-    ids, text, embeds, msgs_in, noreuse = await asyncio.to_thread(
+    ids, text, embeds, keys_in, noreuse = await asyncio.to_thread(
         build_ids_and_embeds, body, conv)
     if not ids:
         raise HTTPException(400, '空 prompt')
@@ -1377,7 +1396,7 @@ async def _complete(body: dict):
             STATS['gen_ms'] += (t2 - t1) * 1000
             txt = T.decode(toks)
             reasoning, answer = split_thinking(txt, thinking_enabled(body))
-            _conv_kv_commit(conv, msgs_in, ids, toks, answer)
+            _conv_kv_commit(conv, keys_in, ids, toks, answer)
             usage = {'prompt_tokens': len(ids), 'completion_tokens': len(toks),
                      'total_tokens': len(ids) + len(toks)}
             pms = (t1 - t0) * 1000
@@ -1490,7 +1509,7 @@ async def _complete(body: dict):
                     await asyncio.to_thread(ENGINE.ensure)
                 else:
                     # 记下这条对话实际提交的 token 序列，下一轮可走「完全命中」
-                    _conv_kv_commit(conv, msgs_in, ids, acc,
+                    _conv_kv_commit(conv, keys_in, ids, acc,
                                     split_thinking(T.decode(acc), think)[1])
             pms = (t1 - t0) * 1000
             gms = (tg1 - tg0) * 1000
@@ -1530,9 +1549,10 @@ async def _skill_events(body, tools):
     conv = _conversation_id(body)
     think = thinking_enabled(body)
     msgs = [m for m in (body.get('messages') or []) if isinstance(m, dict)]
+    # 客户端视角的消息键：工具轮次会往 msgs 里追加 assistant(工具调用)/tool 结果，
+    # 那些是服务端内部拼的，客户端下一轮不会带回来 —— 提交前缀必须用这一份。
+    client_keys = [_conv_msg_key(m) for m in msgs]
     note = _workspace_note(conv)
-    if note:
-        msgs = [{'role': 'system', 'content': note}] + msgs
     stops = list(body.get('stop') or []) + EOS
     events, final_text, final_reasoning = [], '', ''
     prefill_ms = gen_ms = 0.0
@@ -1552,8 +1572,8 @@ async def _skill_events(body, tools):
             work = dict(body)
             work['messages'] = msgs
             work['tools'] = tools
-            ids, rendered, embeds, msgs_in, noreuse = await asyncio.to_thread(
-                build_ids_and_embeds, work, conv)
+            ids, rendered, embeds, keys_in, noreuse = await asyncio.to_thread(
+                build_ids_and_embeds, work, conv, note)
             if not ids:
                 raise HTTPException(400, '空 prompt')
             if len(ids) + n > CTX_LIMIT:
@@ -1626,10 +1646,12 @@ async def _skill_events(body, tools):
                 final_reasoning = reasoning
                 streamed = True                 # 这一轮的文本已经流出去了
                 # 这一轮没有工具调用：把「已提交 token 序列」记下来，下一轮可走完全命中。
-                # 只有文本和客户端收到的完全一致时才记（有剥离就放弃，宁可整段重算）。
-                # 引擎中途崩溃重启过（engine_died）就不记：这段序列没在新引擎里。
-                if final_text == answer and not engine_died:
-                    _conv_kv_commit(conv, msgs_in, ids, toks, final_text)
+                # 客户端最终收到的正文一定就是 final_text：流式那条在收尾时若发现
+                # 「已流出的文字 ≠ final_text」会发 round_reset 把气泡清掉再重发
+                # （见 _complete_with_skills.gen 的 done 分支），所以这里可以直接提交。
+                # 引擎中途崩溃重启过（engine_died）才放弃：这段序列没在新引擎里。
+                if not engine_died:
+                    _conv_kv_commit(conv, client_keys, ids, toks, final_text)
                 break
             assistant = {'role': 'assistant', 'content': answer or full}
             if reasoning:
