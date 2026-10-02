@@ -162,6 +162,18 @@ class Engine:
             self.cmd('PREFILL_NR ' + ','.join(str(i) for i in ids))
             return self.p.stdout.readline().strip()
 
+    def reset(self):
+        """清空引擎侧状态（KV / SSM / MTP 草稿）。
+
+        GGUF（qwen35moe）那条引擎的 PREFILL 是**按顺序追加**的，没有 27B 引擎
+        的「最长公共前缀 + rewind」：不先 RESET 就直接 PREFILL 整段对话，历史会
+        一层层叠上去（多轮对话第二句就开始出乱码）。所以 GGUF 引擎每轮请求都要
+        RESET + 整段重算，见 scripts/serve.py 的 GGUF_ENGINE。
+        """
+        with self.lock:
+            self.cmd('RESET')
+            return self.p.stdout.readline().strip()
+
     def prefill_emb(self, ids, emb_path, spans):
         """带视觉 embedding 的 prefill；spans 为 [(start, count), ...]。"""
         spec = ','.join(f'{int(s)}:{int(c)}' for s, c in spans)

@@ -1998,7 +1998,7 @@ int run_moe35(int argc, char** argv) {
             if (op == "RESET") {
                 reset_states(m);
                 last = -1;
-                printf("OK reset\n");                m.mtp.len = 0; m.mtp_try = m.mtp_hit = 0; m.draft = -1;
+                m.mtp.len = 0; m.mtp_try = m.mtp_hit = 0; m.draft = -1;
                 printf("OK reset\n");
             } else if (op == "MTP") {
                 const int k = atoi(arg.c_str());
@@ -2042,14 +2042,17 @@ int run_moe35(int argc, char** argv) {
                 int made = 0;
                 bool stopped = false;
                 for (int i = 0; i < n; i++) {
-                    last = forward1(m, last);
-                    printf("TOK %d\n", last);
-                    fflush(stdout);
-                    made++;
+                    // `last` 是**已经算好**的下一个 token（PREFILL 最后一格 / 上一次
+                    // GEN 的预测），必须先吐出来再喂回去算再下一个 —— 反过来写会把
+                    // 每次生成的第一个 token 吞掉（「法国的首都是巴黎」→「国的首都是巴黎」，
+                    // 也是「Here's a thinking process」→「's a thinking process」的成因）。
                     if (std::find(stops.begin(), stops.end(), last) != stops.end()) {
                         stopped = true;
                         break;
                     }
+                    printf("TOK %d\n", last);
+                    fflush(stdout);
+                    made++;
                     // 非阻塞看一眼 stdin：客户端按了「停止」就中断本轮
                     struct pollfd pfd{0, POLLIN, 0};
                     if (::poll(&pfd, 1, 0) > 0) {
@@ -2066,6 +2069,7 @@ int run_moe35(int argc, char** argv) {
                             }
                         }
                     }
+                    last = forward1(m, last);      // 喂回去：KV 覆盖到刚吐出的 token
                 }
                 printf("END length=%d%s\n", made, stopped ? " stopped" : "");
                 if (m.mtp_try)

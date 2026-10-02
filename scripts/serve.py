@@ -40,6 +40,9 @@ import uvicorn                                        # noqa: E402
 
 EOS = [248044, 248046]          # <|endoftext|> / <|im_end|>
 MODEL_NAME = os.environ.get('RT_SERVED_NAME', 'qwen38-rt')
+# 后端是不是 GGUF（qwen35moe）那条引擎：它没有 27B 引擎的「最长公共前缀 +
+# rewind」，PREFILL 只往后追加，所以每次 prefill 前必须先 RESET（见 _engine_prefill）。
+GGUF_ENGINE = str(os.environ.get('RT_RT4', '')).lower().endswith('.gguf')
 
 # 附件上限只用于避免网页/接口被超大文件拖死；可按目标机内存调整。
 MAX_UPLOAD_MB = int(os.environ.get('RT_MAX_UPLOAD_MB', '25'))
@@ -1039,6 +1042,10 @@ async def _engine_prefill(ids, embeds, emb_path, spans, noreuse=False):
     本身幂等（自动整段重算），重试是安全的；再失败就原样抛出。"""
     for attempt in (0, 1):
         try:
+            # GGUF（qwen35moe）引擎的 PREFILL 只追加、没有前缀 rewind，必须先
+            # RESET 再整段重算，否则同一进程里跨请求/跨轮次的 KV 会一直叠起来。
+            if GGUF_ENGINE:
+                await asyncio.to_thread(ENGINE.reset)
             if embeds:
                 return await asyncio.to_thread(ENGINE.prefill_emb, ids, emb_path, spans)
             if noreuse:
