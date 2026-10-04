@@ -866,7 +866,9 @@ def health():
 def chat_ui():
     """项目自带的简易对话网页（同源调用 /v1/chat/completions，支持流式）。"""
     if os.path.exists(WEB_INDEX):
-        return FileResponse(WEB_INDEX)
+        # 首页必须不缓存：手机浏览器缓存很顽固，改完前端却一直拿到旧页面，
+        # 会让人误以为修复没生效（style.css / markdown.js 早就带 no-cache 了）。
+        return FileResponse(WEB_INDEX, headers={'Cache-Control': 'no-cache'})
     return HTMLResponse('<h3>缺少 web/index.html</h3>', status_code=500)
 
 
