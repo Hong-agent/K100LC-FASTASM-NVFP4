@@ -561,13 +561,14 @@ function renderFileBar(files) {
     open.type = 'button';
     open.textContent = '打开';
     open.onclick = () => openPreview(f);
-    const dl = document.createElement('a');
-    dl.href = fileURL(f.name, true);
-    dl.download = f.name;
-    const dlBtn = document.createElement('button');
-    dlBtn.type = 'button';
-    dlBtn.textContent = '下载';
-    dl.appendChild(dlBtn);
+    // 下载：**不要**把 <button> 套在 <a> 里——那是无效 HTML，很多移动端浏览器
+    // 会把点击吞在内层 button 上、不触发 <a> 的导航，表现就是「点下载没反应」
+    // （「打开」是 button 直接绑 onclick，所以一直正常）。用 button + JS 导航：
+    // 服务端回 Content-Disposition: attachment，浏览器会下载而不是跳走。
+    const dl = document.createElement('button');
+    dl.type = 'button';
+    dl.textContent = '下载';
+    dl.onclick = () => { window.location.href = fileURL(f.name, true); };
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'fdel';

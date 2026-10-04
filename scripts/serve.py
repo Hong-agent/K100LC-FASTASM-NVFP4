@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -970,6 +971,27 @@ def files_api(conversation_id: str = 'default'):
     return {'conversation_id': conv, 'files': _file_list(conv)}
 
 
+def _content_disposition(disp: str, name: str) -> str:
+    """`Content-Disposition`：**ASCII 回退名和 RFC 5987 的 `filename*` 都给**。
+
+    新版 Starlette 在文件名含非 ASCII 时**只**发 `filename*=utf-8''...`。
+    按规范这已经够了，但实践中部分移动端浏览器（安卓 WebView、若干国产浏览器、
+    应用内嵌浏览器）不认 `filename*`，拿不到文件名就**直接放弃下载**——表现
+    正是「能在网页里打开预览、点下载却失败」。两个都给：认 `filename*` 的用
+    原名（中文不乱码），不认的退回 ASCII 名。
+    """
+    # 回退名要保住扩展名：纯中文名 `测试报告.md` 去掉非 ASCII 后只剩 `.md`，
+    # 直接用会变成名叫「md」的文件，落回 `file.md`。
+    stem, ext = os.path.splitext(name)
+    ascii_stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_',
+                        stem.encode('ascii', 'ignore').decode('ascii')).strip(' .')
+    ascii_ext = re.sub(r'[^A-Za-z0-9.]', '',
+                       ext.encode('ascii', 'ignore').decode('ascii'))
+    fallback = (ascii_stem or 'file') + ascii_ext
+    return (f'{disp}; filename="{fallback}"; '
+            f"filename*=utf-8''" + urllib.parse.quote(name))
+
+
 @app.get('/v1/files/{name}')
 def file_download(name: str, conversation_id: str = 'default', download: int = 0):
     conv = _conversation_id({'conversation_id': conversation_id})
@@ -982,8 +1004,12 @@ def file_download(name: str, conversation_id: str = 'default', download: int = 0
     mime = mimetypes.guess_type(path)[0] or 'application/octet-stream'
     if name.lower().endswith(('.md', '.txt', '.log', '.csv', '.json', '.py', '.sh')):
         mime = 'text/plain; charset=utf-8'
-    return FileResponse(path, media_type=mime, filename=name,
-                        content_disposition_type='attachment' if download else 'inline')
+    disp = 'attachment' if download else 'inline'
+    resp = FileResponse(path, media_type=mime, content_disposition_type=disp)
+    # 用磁盘上的（已 _safe_name 过的）真实名字，别拿请求里的原始参数去拼头
+    resp.headers['content-disposition'] = _content_disposition(
+        disp, os.path.basename(path))
+    return resp
 
 
 @app.delete('/v1/files/{name}')
