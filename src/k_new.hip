@@ -113,6 +113,17 @@ static const float* zc_weight(const float* w, int D) {
     return p;
 }
 
+// `rmsnorm_deep_k`（K100LC-kernels v1.9.12）：同一套算法，把一趟的 load 从
+// 4 条加到 16 条。它是**单 workgroup 处理整行**的，每 lane 要读 D/64 个元素，
+// 完整访存往返 = D/256 —— 深流水直接把这个数除以 4。实测 D=5120 时
+// 26.5 → 13.0 us、D=10240 时 48.2 → 20.2 us，**输出与 fast 版逐位相同**
+// （NB 不改 Σx² 的加法顺序）。D 小（≤1024，比如 q/k norm 的 head_dim）时
+// 主循环进不去、反而更慢，所以只在 D >= 2048 用。RT_NODEEPNORM=1 关掉。
+static const bool g_deepnorm = [] {
+    const char* e = getenv("RT_NODEEPNORM");
+    return !(e && atoi(e) != 0);
+}();
+
 void k_rmsnorm(float* y, const float* x, const float* w, int rows, int D, float eps, bool zc) {
     // 快速 RMSNorm（K100LC-kernels v1.9.10 的 rmsnorm_fast_k，源码见
     // kernels/asm/k_pkg/rmsnorm_fast_k.s）：同一套算法，但把 load 按 4 个一批发
@@ -123,10 +134,18 @@ void k_rmsnorm(float* y, const float* x, const float* w, int rows, int D, float 
     // 预先算进一张常驻设备缓冲（每个权重只算一次），之后每次调用都能走快速内核。
     // 本项目里它不比 rmsnorm_k 快（实测见 README），所以只由 RT_FASTNORM=1 打开；
     // 维度不满足 D % 64 == 0 时自动退回旧内核。
-    if (g_fastnorm && rows > 0 && (D & 63) == 0) {
-        rmsnorm_fast_k<<<rows, 64>>>(y, x, zc ? zc_weight(w, D) : w, D, eps);
-        CK(hipGetLastError());
-        return;
+    if (rows > 0 && (D & 63) == 0) {
+        const float* ww = zc ? zc_weight(w, D) : w;
+        if (g_deepnorm && D >= 2048) {
+            rmsnorm_deep_k<<<rows, 64>>>(y, x, ww, D, eps);
+            CK(hipGetLastError());
+            return;
+        }
+        if (g_fastnorm) {
+            rmsnorm_fast_k<<<rows, 64>>>(y, x, ww, D, eps);
+            CK(hipGetLastError());
+            return;
+        }
     }
     rmsnorm_k<<<rows, D >= 256 ? 256 : 64>>>(y, x, w, D, eps, zc ? 1 : 0); CK(hipGetLastError());
 }

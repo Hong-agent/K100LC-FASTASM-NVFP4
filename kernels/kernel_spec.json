@@ -13189,6 +13189,51 @@
   "group_segment": 1024,
   "private_segment": 0,
   "asm": "k_pkg/rmsnorm_fast_k.s"
+},
+ {
+  "name": "rmsnorm_deep_k",
+  "args": [
+   {
+    ".actual_access": "read_only",
+    ".address_space": "global",
+    ".offset": 0,
+    ".size": 8,
+    ".value_kind": "global_buffer"
+   },
+   {
+    ".actual_access": "read_only",
+    ".address_space": "global",
+    ".offset": 8,
+    ".size": 8,
+    ".value_kind": "global_buffer"
+   },
+   {
+    ".actual_access": "read_only",
+    ".address_space": "global",
+    ".offset": 16,
+    ".size": 8,
+    ".value_kind": "global_buffer"
+   },
+   {
+    ".address_space": "global",
+    ".offset": 24,
+    ".size": 4,
+    ".value_kind": "by_value"
+   },
+   {
+    ".address_space": "global",
+    ".offset": 28,
+    ".size": 4,
+    ".value_kind": "by_value"
+   }
+  ],
+  "kernarg_size": 32,
+  "kernarg_align": 8,
+  "sgpr_count": 40,
+  "vgpr_count": 136,
+  "group_segment": 1024,
+  "private_segment": 0,
+  "asm": "k_pkg/rmsnorm_deep_k.s"
  },
  {
   "name": "vt_scatter_v1_k",

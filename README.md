@@ -172,7 +172,7 @@ python3 tests/test_rmsnorm_fast.py           # 新内核 rmsnorm_fast_k 的逐�
 | W4A4 / W4A8 GEMV | `gemv_w4a4_r2_k`、`gemv_w4a4_r2_m3_k`、`gemv_i8_k`、`gemv_f32_k`、`gemv_f32_warp_k` |
 | GGUF 原生解码/点积 | `q2_0/q4_0/q8_0/iq4nl/iq4xs/iq2s/iq3s/iq3xxs/q4k/q5k/q6k` 的 `*_dequant_k` / `*_dot_k` |
 | 通用算子 | `gelu_mul_k`、`softmax_k`、`layernorm_k`、`topk_k`、`router_top10_k`、`iq4nl_to_i8_k` |
-| **v1.9.x 新增（本轮同步）** | `rmsnorm_fast_k`、`vt_scatter_k` / `vt_scatter_v_k` / `vt_scatter_v1_k`、`flash_dec_part_k` / `flash_dec_comb_k`、`gemv_f32_rows8_k` / `_acc_k` / `_split_k`、`gemv_f32_warp_acc_k`、`gemv_f32_gated_acc_k`、`moe_combine_k` / `moe_combine_gather_k`、`gather_rows_k`、`softmax_vec_k`、`block_max_k` / `block_exp_sum_k`、`reduce_max1_k` / `reduce_sum1_k`、`div_scalar_k`、`rope_apply_k`、`embed_f16_k`、`attn_pv_part` |
+| **v1.9.x 新增（本轮同步）** | `rmsnorm_fast_k` / `rmsnorm_deep_k`、`vt_scatter_k` / `vt_scatter_v_k` / `vt_scatter_v1_k`、`flash_dec_part_k` / `flash_dec_comb_k`、`gemv_f32_rows8_k` / `_acc_k` / `_split_k`、`gemv_f32_warp_acc_k`、`gemv_f32_gated_acc_k`、`moe_combine_k` / `moe_combine_gather_k`、`gather_rows_k`、`softmax_vec_k`、`block_max_k` / `block_exp_sum_k`、`reduce_max1_k` / `reduce_sum1_k`、`div_scalar_k`、`rope_apply_k`、`embed_f16_k`、`attn_pv_part` |
 
 ### 新内核在**本项目**里能接到哪一步（实测）
 
@@ -182,7 +182,7 @@ W4A8 GEMV、融合多头解码注意力），所以能直接替换的点不多�
 
 | 新内核 | 本项目里对应的位置 | 结论 |
 |---|---|---|
-| `rmsnorm_fast_k` | `k_rmsnorm`（src/k_new.hip，两条模型路径都在用） | **已接**，开关 `RT_FASTNORM`（默认 `0`）。见下面的实测 |
+| `rmsnorm_fast_k` / `rmsnorm_deep_k` | `k_rmsnorm`（src/k_new.hip，两条模型路径都在用） | **deep 默认接在 `D>=2048`**（`RT_NODEEPNORM=1` 关）；fast 仍可选（`RT_FASTNORM`，默认 `0`）。见下面的实测 |
 | `gemv_f32_rows8_k` / `_acc_k` / `_split_k` / `gemv_f32_warp_acc_k` / `gemv_f32_gated_acc_k` | 稠密 f32 GEMV；本项目线性层走 W4A8，只有 MoE 路由曾是 f32，且已改成 W8 | 暂时挂不上（形状/精度都不合适） |
 | `flash_dec_part_k` / `flash_dec_comb_k` / `attn_pv_part` | `k_attention`（打包 KV + 融合多头解码） | 布局不同：包内是 f32 转置 K / 行主序 V，本项目 KV 是 int4/int8 打包 |
 | `softmax_vec_k`、`block_max_k`、`block_exp_sum_k`、`reduce_max1_k`、`reduce_sum1_k`、`div_scalar_k` | 本项目 softmax 在注意力内核内部（online softmax），没有独立 softmax 调用 | 无调用点 |
@@ -208,6 +208,25 @@ W4A8 GEMV、融合多头解码注意力），所以能直接替换的点不多�
 `rmsnorm_fast_k` 把 4 条 load 一批发并没有换来好处。因为收益为 0 而数值上
 会有 1e-6 量级的重排差异（端到端 greedy 输出可能因此改道），**默认不开**，
 要做对照或等后续版本再量时用 `RT_FASTNORM=1`。
+
+#### `rmsnorm_deep_k`（K100LC-kernels v1.9.12）：**已接，默认开**
+
+`rmsnorm_fast_k` 收益为 0 的根因不是「发 4 条一批」这个办法，而是**深度不够**：
+它是单 workgroup 处理整行，每 lane 读 `D/64` 个元素，完整访存往返 = `D/256`
+——D=5120 时是 20 次，4 条一批只把往返从 80 次降到 20 次，所以贴着 `rmsnorm_k`
+不动。**加深流水版 `rmsnorm_deep_k`** 把一趟发到 16 条（往返再除 4，D=5120 只
+剩 5 次），同一套算法、同一份 ABI、**输出与 fast 版逐位相同**（NB 不改 Σx² 的
+加法顺序）：
+
+| 测法 | 现役 `rmsnorm_k` | `rmsnorm_deep_k` |
+|---|---|---|
+| 单核微基准，rows=1 / D=5120 | 22.2 µs | **13.0 µs** |
+| 27B 端到端（`RT_NO_MTP=1 --n 128`，各 2 次取均值） | 43.76 ms/token | **42.05 ms/token（−3.9%）** |
+
+`k_rmsnorm` 在 `D >= 2048` 时走 deep；D 小（比如 q/k norm 的 `head_dim=128`）
+时主循环进不去、反而更慢，仍走原路。`RT_NODEEPNORM=1` 可关掉回旧路做对照。
+备注：端到端那组**必须先关掉 MTP**（`RT_NO_MTP=1`）——MTP 的接受率抖动
+（75.8% vs 71.4%）会把 4% 的收益整个盖住，我第一次量就因此误判成「更慢」。
 
 引擎实际启动的仍只是其中 63 个；其余内核在 HSACO 里可用，需要时按
 `K100LC-kernels/docs/ABI.md` 的参数表启动即可。
